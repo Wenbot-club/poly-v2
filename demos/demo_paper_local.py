@@ -74,7 +74,7 @@ def build_demo_event_script(state: LocalState) -> List[Dict[str, Any]]:
 
 def run_async_local_demo(
     *,
-    output_path: str | Path = "artifacts/demo_async_runner_local.jsonl",
+    output_path: str | Path = "artifacts/demo_paper_local.jsonl",
     config: RuntimeConfig = DEFAULT_CONFIG,
 ) -> Tuple[AsyncRunSummary, ReplaySummary]:
     state = build_demo_state(config)
@@ -100,7 +100,7 @@ def format_demo_output(summary: AsyncRunSummary, replay: ReplaySummary, output_p
 
 
 def main() -> None:
-    output_path = Path("artifacts/demo_async_runner_local.jsonl")
+    output_path = Path("artifacts/demo_paper_local.jsonl")
     summary, replay = run_async_local_demo(output_path=output_path)
     print(format_demo_output(summary, replay, output_path))
 
