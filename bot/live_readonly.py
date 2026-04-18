@@ -53,15 +53,16 @@ class LiveReadonlySession:
     """
     Autonomous read-only live session.
 
-    Lifecycle:
+    Lifecycle (standalone):
         session = LiveReadonlySession(discovery=..., provider=...)
         summary = await session.run_for(duration=30)
         state   = session.state   # LocalState after run
 
-    Or for indefinite runs (stopped by calling close() from another task):
-        await session.run_forever()
+    Lifecycle (shared state, e.g. from LiveCombinedSession):
+        session = LiveReadonlySession(discovery=..., provider=..., state=shared_state)
+        # run_for() skips discovery and uses state.market directly
 
-    The provider and discovery are injected — pass fakes for testing.
+    The provider, discovery, and state are injected — pass fakes for testing.
     """
 
     def __init__(
@@ -71,13 +72,15 @@ class LiveReadonlySession:
         provider: MarketDataProvider,
         config: RuntimeConfig = DEFAULT_CONFIG,
         router: Optional[MarketMessageRouter] = None,
+        state: Optional[LocalState] = None,
     ) -> None:
         self._discovery = discovery
         self._provider = provider
         self._config = config
         self._router = router or MarketMessageRouter()
+        # Pre-populate with an external state to skip discovery in run_for().
         # Accessible after run_for() / run_forever() for inspection and testing.
-        self.state: Optional[LocalState] = None
+        self.state: Optional[LocalState] = state
 
     # ---------------------------------------------------------------------- #
     # Public interface                                                         #
@@ -93,9 +96,13 @@ class LiveReadonlySession:
         """
         started_at_ms = utc_now_ms()
 
-        market = await self._discovery.find_active_btc_15m_market()
-        state = StateFactory(self._config).create(market)
-        self.state = state
+        if self.state is not None:
+            state = self.state
+            market = state.market
+        else:
+            market = await self._discovery.find_active_btc_15m_market()
+            state = StateFactory(self._config).create(market)
+            self.state = state
 
         counters: Dict[str, int] = {"total": 0, "book": 0, "price_change": 0, "other": 0}
         snapshotted: set[str] = set()
@@ -159,9 +166,13 @@ class LiveReadonlySession:
         Run indefinitely until close() is called (from another task) or the
         provider disconnects.  No summary is returned; inspect self.state directly.
         """
-        market = await self._discovery.find_active_btc_15m_market()
-        state = StateFactory(self._config).create(market)
-        self.state = state
+        if self.state is not None:
+            state = self.state
+            market = state.market
+        else:
+            market = await self._discovery.find_active_btc_15m_market()
+            state = StateFactory(self._config).create(market)
+            self.state = state
         await self._provider.connect([market.yes_token_id, market.no_token_id])
         try:
             async for msg in self._provider.iter_messages():
