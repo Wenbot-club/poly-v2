@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
+from .execution.base import ExecutionGateway
 from .execution.paper import MockExecutionEngine
 from .fair_value import FairValueEngine
 from .ptb import PTBLocker
+from .strategy.base import Strategy
 from .strategy.baseline import QuotePolicy
 from .recorder import JSONLRecorder
 from .settings import RuntimeConfig
@@ -43,6 +45,33 @@ class AsyncLocalRunner:
     event_script: List[Dict[str, Any]]
     recorder: Optional[JSONLRecorder] = None
 
+    # Injectable collaborators — None triggers default construction in __post_init__
+    market_router: Optional[MarketMessageRouter] = None
+    rtds_router: Optional[RTDSMessageRouter] = None
+    user_router: Optional[UserMessageRouter] = None
+    strategy: Optional[Strategy] = None
+    ptb_locker: Optional[PTBLocker] = None
+    fair_engine: Optional[FairValueEngine] = None
+
+    # Factory receives the runtime QueueingUserRouter so the engine is wired
+    # to the correct queue — injecting a pre-built engine instance is not safe
+    # because the queue is only created inside run().
+    execution_engine_factory: Optional[Callable[[QueueingUserRouter], ExecutionGateway]] = None
+
+    def __post_init__(self) -> None:
+        if self.market_router is None:
+            self.market_router = MarketMessageRouter()
+        if self.rtds_router is None:
+            self.rtds_router = RTDSMessageRouter(self.config)
+        if self.user_router is None:
+            self.user_router = UserMessageRouter()
+        if self.ptb_locker is None:
+            self.ptb_locker = PTBLocker(self.config)
+        if self.fair_engine is None:
+            self.fair_engine = FairValueEngine(self.config)
+        if self.strategy is None:
+            self.strategy = QuotePolicy(self.config)
+
     async def run(self) -> AsyncRunSummary:
         market_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
         rtds_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
@@ -52,14 +81,12 @@ class AsyncLocalRunner:
         sequencing_done = asyncio.Event()
         control_done = asyncio.Event()
 
-        market_router = MarketMessageRouter()
-        rtds_router = RTDSMessageRouter(self.config)
-        user_router = UserMessageRouter()
         queueing_user_router = QueueingUserRouter(user_queue, recorder=self.recorder)
-        engine = MockExecutionEngine(config=self.config, user_router=queueing_user_router)
-        ptb_locker = PTBLocker(self.config)
-        fair_engine = FairValueEngine(self.config)
-        quote_policy = QuotePolicy(self.config)
+        engine: ExecutionGateway = (
+            self.execution_engine_factory(queueing_user_router)
+            if self.execution_engine_factory is not None
+            else MockExecutionEngine(config=self.config, user_router=queueing_user_router)
+        )
 
         actions: List[str] = []
         temporal_checks: List[dict] = []
@@ -106,7 +133,7 @@ class AsyncLocalRunner:
                 except asyncio.TimeoutError:
                     continue
                 try:
-                    market_router.apply(self.state, msg)
+                    self.market_router.apply(self.state, msg)
                 finally:
                     market_queue.task_done()
 
@@ -117,7 +144,7 @@ class AsyncLocalRunner:
                 except asyncio.TimeoutError:
                     continue
                 try:
-                    rtds_router.apply(self.state, msg)
+                    self.rtds_router.apply(self.state, msg)
                 finally:
                     rtds_queue.task_done()
 
@@ -130,7 +157,7 @@ class AsyncLocalRunner:
                         break
                     continue
                 try:
-                    user_router.apply(self.state, msg)
+                    self.user_router.apply(self.state, msg)
                 finally:
                     user_queue.task_done()
 
@@ -148,10 +175,10 @@ class AsyncLocalRunner:
                         self.state.set_clock(now_ms)
 
                         if op == "quote":
-                            ptb_locker.try_lock(self.state, now_ms=now_ms)
+                            self.ptb_locker.try_lock(self.state, now_ms=now_ms)
                             self._assert_temporal_consistency(now_ms, temporal_checks, label=str(tick.get("label", "quote")))
-                            fair = fair_engine.compute(self.state, now_ms=now_ms)
-                            desired = quote_policy.build(self.state, fair, now_ms=now_ms)
+                            fair = self.fair_engine.compute(self.state, now_ms=now_ms)
+                            desired = self.strategy.build(self.state, fair, now_ms=now_ms)
                             sync_actions = self._sync_quotes(engine, desired, now_ms)
                             actions.extend(sync_actions)
                             self._record_actions(sync_actions, now_ms)
@@ -224,7 +251,7 @@ class AsyncLocalRunner:
         assert max_recv_ts <= now_ms, (label, max_recv_ts, now_ms)
         sink.append({"label": label, "now_ms": now_ms, "max_payload_ts": max_payload_ts, "max_recv_ts": max_recv_ts, "temporal_assertions_passed": True})
 
-    def _sync_quotes(self, engine: MockExecutionEngine, desired: DesiredQuotes, now_ms: int) -> List[str]:
+    def _sync_quotes(self, engine: ExecutionGateway, desired: DesiredQuotes, now_ms: int) -> List[str]:
         actions: List[str] = []
         threshold = self.config.thresholds.quote.size_change_reprice_ratio.value
         current_bid = self.state.open_orders.get(self.state.live_bid_order_id) if self.state.live_bid_order_id else None
