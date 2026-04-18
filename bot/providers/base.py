@@ -32,3 +32,29 @@ class MarketDataProvider(Protocol):
     async def connect(self, token_ids: List[str]) -> None: ...
     async def close(self) -> None: ...
     async def iter_messages(self) -> AsyncIterator[Dict[str, Any]]: ...
+
+
+class SignalProvider(Protocol):
+    """
+    Read-only live price/signal feed (e.g. Binance aggTrade).
+
+    iter_signals() yields normalized internal RTDS dicts ready for
+    RTDSMessageRouter.apply() — not raw wire payloads.
+
+    Implemented for this repo:
+      BinanceSignalProvider — btcusdt@aggTrade (no auth)
+
+    Not yet implemented (out of scope until auth/RPC confirmed):
+      Chainlink — Data Streams API requires credentials;
+                  on-chain queries require a blockchain RPC node.
+
+    feed_state transitions mirror MarketDataProvider:
+      connecting → live (on first valid signal)
+      live → stale (no signal within stale_timeout_ms)
+      any → disconnected (on close())
+    """
+    feed_state: Literal["connecting", "live", "stale", "disconnected"]
+
+    async def connect(self, symbol: str) -> None: ...
+    async def close(self) -> None: ...
+    async def iter_signals(self) -> AsyncIterator[Dict[str, Any]]: ...
