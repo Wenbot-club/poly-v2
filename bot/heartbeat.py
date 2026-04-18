@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .types import LocalState
+from .domain import LocalState
 
 
 @dataclass(slots=True)

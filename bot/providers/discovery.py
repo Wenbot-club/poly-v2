@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from .types import ClobMarketInfo, ClobToken, DiscoveryCandidate, MarketContext
+from ..domain import ClobMarketInfo, ClobToken, DiscoveryCandidate, MarketContext
 
 
 @dataclass(slots=True)

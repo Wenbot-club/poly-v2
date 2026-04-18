@@ -4,16 +4,16 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from .execution import MockExecutionEngine
+from .execution.paper import MockExecutionEngine
 from .fair_value import FairValueEngine
 from .ptb import PTBLocker
-from .quote_policy import QuotePolicy
+from .strategy.baseline import QuotePolicy
 from .recorder import JSONLRecorder
 from .settings import RuntimeConfig
-from .types import DesiredQuotes, LocalState
-from .ws_market import MarketMessageRouter
-from .ws_rtds import RTDSMessageRouter
-from .ws_user import UserMessageRouter
+from .domain import DesiredQuotes, LocalState
+from .routers.ws_market import MarketMessageRouter
+from .routers.ws_rtds import RTDSMessageRouter
+from .routers.ws_user import UserMessageRouter
 
 
 class QueueingUserRouter:

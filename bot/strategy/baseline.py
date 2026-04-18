@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
-from .types import DesiredOrder, DesiredQuotes, FairValueSnapshot, LocalState
+from ..state import sigma_60_from_binance
+from ..domain import DesiredOrder, DesiredQuotes, FairValueSnapshot, LocalState
 
 
 @dataclass

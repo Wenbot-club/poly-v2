@@ -5,7 +5,7 @@ from typing import List
 
 from .settings import RuntimeConfig
 from .state import chainlink_age_ms, market_book_age_ms
-from .types import LocalState
+from .domain import LocalState
 
 
 @dataclass(slots=True)

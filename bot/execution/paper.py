@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from itertools import count
 from typing import List, Optional
 
-from .settings import RuntimeConfig
-from .types import LocalState, normalize_side
-from .ws_user import UserMessageRouter
+from ..settings import RuntimeConfig
+from ..domain import LocalState, normalize_side
+from ..routers.ws_user import UserMessageRouter
 
 
 @dataclass

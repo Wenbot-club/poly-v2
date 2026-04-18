@@ -4,10 +4,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .discovery import DiscoveryService, MockGammaClient
+from .providers.discovery import DiscoveryService, MockGammaClient
 from .settings import DEFAULT_CONFIG
 from .state import StateFactory
-from .ws_user import UserMessageRouter
+from .routers.ws_user import UserMessageRouter
 
 
 @dataclass(slots=True)

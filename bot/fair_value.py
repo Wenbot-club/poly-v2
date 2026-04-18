@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .state import sigma_60_from_binance
-from .types import FairValueSnapshot, LocalState
+from .domain import FairValueSnapshot, LocalState
 
 
 _ZSCORE_FACTOR = 0.339100683

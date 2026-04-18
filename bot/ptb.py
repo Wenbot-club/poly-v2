@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List
 
 from .settings import RuntimeConfig
-from .types import LocalState, PTBDecision, PriceTick
+from .domain import LocalState, PTBDecision, PriceTick
 
 
 @dataclass

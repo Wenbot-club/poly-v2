@@ -5,7 +5,7 @@ from statistics import pstdev
 from typing import Optional
 
 from .settings import RuntimeConfig
-from .types import LocalState, MarketContext, PriceTick, TokenBook
+from .domain import LocalState, MarketContext, PriceTick, TokenBook
 
 
 @dataclass

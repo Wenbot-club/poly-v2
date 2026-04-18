@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable
 
-from .types import LiveOrder, LocalState, UserOrderEvent, UserTradeEvent, normalize_side
+from ..domain import LiveOrder, LocalState, UserOrderEvent, UserTradeEvent, normalize_side
 
 
 @dataclass
