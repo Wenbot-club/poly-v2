@@ -9,7 +9,7 @@ from demos.demo_paper_local import format_demo_output, run_async_local_demo
 
 def main() -> None:
     output_path = Path("artifacts/demo_async_runner_local.jsonl")
-    summary, replay = run_async_local_demo(output_path=output_path)
+    summary, replay = run_async_local_demo(output_path=output_path)  # distinct output path
     print(format_demo_output(summary, replay, output_path))
 
 
