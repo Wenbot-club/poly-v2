@@ -102,6 +102,27 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"  pnl_unrealized_mark     : {round(pum, 4) if pum is not None else None}")
     print(f"  cost_basis              : {round(summary.cost_basis, 4)}")
 
+    print("\n  [attribution]")
+    print(f"  decisions_triggered_by_market : {summary.decisions_triggered_by_market}")
+    print(f"  decisions_triggered_by_rtds   : {summary.decisions_triggered_by_rtds}")
+    print(f"  decisions_ptb_locked          : {summary.decisions_ptb_locked}")
+    print(f"  decisions_bid_enabled         : {summary.decisions_bid_enabled}")
+    print(f"  decisions_ask_enabled         : {summary.decisions_ask_enabled}")
+
+    print("\n  [data age at decision]")
+    print(f"  avg_binance_age_ms   : {summary.avg_binance_age_ms_at_decision}")
+    print(f"  max_binance_age_ms   : {summary.max_binance_age_ms_at_decision}")
+    print(f"  avg_chainlink_age_ms : {summary.avg_chainlink_age_ms_at_decision}")
+    print(f"  max_chainlink_age_ms : {summary.max_chainlink_age_ms_at_decision}")
+    print(f"  avg_book_event_age_ms: {summary.avg_book_event_age_ms_at_decision}")
+    print(f"  max_book_event_age_ms: {summary.max_book_event_age_ms_at_decision}")
+
+    print("\n  [attribution aggregates]")
+    print(f"  avg_abs_binance_chainlink_gap : {summary.avg_abs_binance_chainlink_gap_at_decision}")
+    print(f"  max_abs_binance_chainlink_gap : {summary.max_abs_binance_chainlink_gap_at_decision}")
+    print(f"  avg_fair_minus_best_bid       : {summary.avg_fair_minus_best_bid_at_decision}")
+    print(f"  avg_best_ask_minus_fair       : {summary.avg_best_ask_minus_fair_at_decision}")
+
     if summary.skipped_fair_value_count > 0 and summary.decision_count == 0:
         print(
             f"\n  NOTE: {summary.skipped_fair_value_count} decision cycles skipped —"

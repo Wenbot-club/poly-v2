@@ -106,6 +106,24 @@ class LivePaperSummary:
     cost_basis: float                       # PUSD spent acquiring YES = initial_pusd - pusd_free
     mark_price: Optional[float]             # yes_book.top_bid().price at session end
     mark_source: str                        # always "yes_book_top_bid"
+    # Attribution counters (per unique dedup-passing decision)
+    decisions_triggered_by_market: int
+    decisions_triggered_by_rtds: int
+    decisions_ptb_locked: int
+    decisions_bid_enabled: int
+    decisions_ask_enabled: int
+    # Data age at moment of decision (event timestamp age, not network latency)
+    avg_binance_age_ms_at_decision: Optional[float]
+    max_binance_age_ms_at_decision: Optional[int]
+    avg_chainlink_age_ms_at_decision: Optional[float]
+    max_chainlink_age_ms_at_decision: Optional[int]
+    avg_book_event_age_ms_at_decision: Optional[float]
+    max_book_event_age_ms_at_decision: Optional[int]
+    # Attribution aggregates
+    avg_abs_binance_chainlink_gap_at_decision: Optional[float]
+    max_abs_binance_chainlink_gap_at_decision: Optional[float]
+    avg_fair_minus_best_bid_at_decision: Optional[float]
+    avg_best_ask_minus_fair_at_decision: Optional[float]
 
 
 class LivePaperSession:
@@ -143,6 +161,7 @@ class LivePaperSession:
         ptb_locker: Optional[PTBLocker] = None,
         execution_engine_factory: Optional[Callable[[QueueingUserRouter], ExecutionGateway]] = None,
         decision_poll_ms: int = 100,
+        now_fn: Callable[[], int] = utc_now_ms,
     ) -> None:
         self._discovery = discovery
         self._market_provider = market_provider
@@ -157,6 +176,7 @@ class LivePaperSession:
         self._ptb_locker = ptb_locker or PTBLocker(config=config)
         self._execution_engine_factory = execution_engine_factory
         self._decision_poll_ms = decision_poll_ms
+        self._now_fn = now_fn
 
         self.state: Optional[LocalState] = None
         self.decisions: list[DecisionSnapshot] = []
@@ -181,6 +201,20 @@ class LivePaperSession:
         self._max_pusd_reserved: float = 0.0
         self._last_rejection_reason: Optional[str] = None
         self._portfolio_value_start: float = 0.0
+        # Attribution counters
+        self._decisions_triggered_by_market: int = 0
+        self._decisions_triggered_by_rtds: int = 0
+        self._decisions_ptb_locked: int = 0
+        self._decisions_bid_enabled: int = 0
+        self._decisions_ask_enabled: int = 0
+        # Age samples per decision
+        self._binance_ages: list[int] = []
+        self._chainlink_ages: list[int] = []
+        self._book_event_ages: list[int] = []
+        # Attribution samples per decision
+        self._abs_gaps: list[float] = []
+        self._fair_minus_bid_samples: list[float] = []
+        self._ask_minus_fair_samples: list[float] = []
 
     # ---------------------------------------------------------------------- #
     # Public interface                                                         #
@@ -245,7 +279,16 @@ class LivePaperSession:
                 await decision_task
             except asyncio.CancelledError:
                 pass
-            self._poll_and_execute(state, utc_now_ms())
+            self._poll_and_execute(state, self._now_fn())
+
+        def _avg(lst: list) -> Optional[float]:
+            return sum(lst) / len(lst) if lst else None
+
+        def _max_int(lst: list[int]) -> Optional[int]:
+            return max(lst) if lst else None
+
+        def _max_float(lst: list[float]) -> Optional[float]:
+            return max(lst) if lst else None
 
         posted = self._orders_posted
         filled = len(self._filled_order_ids)
@@ -286,8 +329,19 @@ class LivePaperSession:
             pnl_total_mark = portfolio_value_end_mark - portfolio_value_start
             pnl_unrealized_mark = 0.0
 
+        avg_binance_age = _avg(self._binance_ages)
+        max_binance_age = _max_int(self._binance_ages)
+        avg_chainlink_age = _avg(self._chainlink_ages)
+        max_chainlink_age = _max_int(self._chainlink_ages)
+        avg_book_age = _avg(self._book_event_ages)
+        max_book_age = _max_int(self._book_event_ages)
+        avg_abs_gap = _avg(self._abs_gaps)
+        max_abs_gap = _max_float(self._abs_gaps)
+        avg_fair_minus_bid = _avg(self._fair_minus_bid_samples)
+        avg_ask_minus_fair = _avg(self._ask_minus_fair_samples)
+
         self.events.append({
-            "ts_ms": utc_now_ms(),
+            "ts_ms": self._now_fn(),
             "event": "session_end",
             "portfolio_value_start": portfolio_value_start,
             "portfolio_value_end_mark": portfolio_value_end_mark,
@@ -299,6 +353,21 @@ class LivePaperSession:
             "up_free": final_up_free,
             "pusd_free": final_pusd_free,
             "pusd_reserved": final_pusd_reserved,
+            "decisions_triggered_by_market": self._decisions_triggered_by_market,
+            "decisions_triggered_by_rtds": self._decisions_triggered_by_rtds,
+            "decisions_ptb_locked": self._decisions_ptb_locked,
+            "decisions_bid_enabled": self._decisions_bid_enabled,
+            "decisions_ask_enabled": self._decisions_ask_enabled,
+            "avg_binance_age_ms_at_decision": avg_binance_age,
+            "max_binance_age_ms_at_decision": max_binance_age,
+            "avg_chainlink_age_ms_at_decision": avg_chainlink_age,
+            "max_chainlink_age_ms_at_decision": max_chainlink_age,
+            "avg_book_event_age_ms_at_decision": avg_book_age,
+            "max_book_event_age_ms_at_decision": max_book_age,
+            "avg_abs_binance_chainlink_gap_at_decision": avg_abs_gap,
+            "max_abs_binance_chainlink_gap_at_decision": max_abs_gap,
+            "avg_fair_minus_best_bid_at_decision": avg_fair_minus_bid,
+            "avg_best_ask_minus_fair_at_decision": avg_ask_minus_fair,
         })
 
         return LivePaperSummary(
@@ -332,6 +401,21 @@ class LivePaperSession:
             cost_basis=cost_basis,
             mark_price=mark_price,
             mark_source=mark_source,
+            decisions_triggered_by_market=self._decisions_triggered_by_market,
+            decisions_triggered_by_rtds=self._decisions_triggered_by_rtds,
+            decisions_ptb_locked=self._decisions_ptb_locked,
+            decisions_bid_enabled=self._decisions_bid_enabled,
+            decisions_ask_enabled=self._decisions_ask_enabled,
+            avg_binance_age_ms_at_decision=avg_binance_age,
+            max_binance_age_ms_at_decision=max_binance_age,
+            avg_chainlink_age_ms_at_decision=avg_chainlink_age,
+            max_chainlink_age_ms_at_decision=max_chainlink_age,
+            avg_book_event_age_ms_at_decision=avg_book_age,
+            max_book_event_age_ms_at_decision=max_book_age,
+            avg_abs_binance_chainlink_gap_at_decision=avg_abs_gap,
+            max_abs_binance_chainlink_gap_at_decision=max_abs_gap,
+            avg_fair_minus_best_bid_at_decision=avg_fair_minus_bid,
+            avg_best_ask_minus_fair_at_decision=avg_ask_minus_fair,
         )
 
     async def run_forever(self) -> None:
@@ -401,7 +485,7 @@ class LivePaperSession:
 
     async def _decision_loop(self, state: LocalState) -> None:
         while True:
-            self._poll_and_execute(state, utc_now_ms())
+            self._poll_and_execute(state, self._now_fn())
             await asyncio.sleep(self._decision_poll_ms / 1000.0)
 
     def _poll_and_execute(self, state: LocalState, now_ms: int) -> None:
@@ -442,6 +526,69 @@ class LivePaperSession:
         key = self._dedup_key_from(fair, desired)
         if key != self._last_dedup_key:
             self._last_dedup_key = key
+
+            # Attribution counters
+            if trigger == "market":
+                self._decisions_triggered_by_market += 1
+            else:
+                self._decisions_triggered_by_rtds += 1
+            if ptb.locked:
+                self._decisions_ptb_locked += 1
+            if desired.bid.enabled:
+                self._decisions_bid_enabled += 1
+            if desired.ask.enabled:
+                self._decisions_ask_enabled += 1
+
+            # Data values for attribution
+            binance_value: Optional[float] = (
+                state.last_binance.value if state.last_binance is not None else None
+            )
+            chainlink_value: Optional[float] = (
+                state.last_chainlink.value if state.last_chainlink is not None else None
+            )
+            binance_chainlink_gap: Optional[float] = (
+                binance_value - chainlink_value
+                if binance_value is not None and chainlink_value is not None else None
+            )
+            top_bid = state.yes_book.top_bid()
+            top_ask = state.yes_book.top_ask()
+            best_bid: Optional[float] = top_bid.price if top_bid is not None else None
+            best_ask: Optional[float] = top_ask.price if top_ask is not None else None
+            fair_minus_best_bid: Optional[float] = (
+                fair.p_up - best_bid if best_bid is not None else None
+            )
+            best_ask_minus_fair: Optional[float] = (
+                best_ask - fair.p_up if best_ask is not None else None
+            )
+
+            # Data age at decision (event timestamp age, not network latency)
+            binance_age_ms: Optional[int] = (
+                now_ms - state.last_binance.recv_timestamp_ms
+                if state.last_binance is not None else None
+            )
+            chainlink_age_ms: Optional[int] = (
+                now_ms - state.last_chainlink.recv_timestamp_ms
+                if state.last_chainlink is not None else None
+            )
+            book_event_age_ms: Optional[int] = (
+                now_ms - state.yes_book.timestamp_ms
+                if state.yes_book.timestamp_ms != 0 else None
+            )
+
+            # Accumulate samples for summary aggregation
+            if binance_age_ms is not None:
+                self._binance_ages.append(binance_age_ms)
+            if chainlink_age_ms is not None:
+                self._chainlink_ages.append(chainlink_age_ms)
+            if book_event_age_ms is not None:
+                self._book_event_ages.append(book_event_age_ms)
+            if binance_chainlink_gap is not None:
+                self._abs_gaps.append(abs(binance_chainlink_gap))
+            if fair_minus_best_bid is not None:
+                self._fair_minus_bid_samples.append(fair_minus_best_bid)
+            if best_ask_minus_fair is not None:
+                self._ask_minus_fair_samples.append(best_ask_minus_fair)
+
             self.decisions.append(
                 DecisionSnapshot(
                     now_ms=now_ms,
@@ -463,6 +610,18 @@ class LivePaperSession:
                 "ask_enabled": desired.ask.enabled,
                 "ptb_locked": ptb.locked,
                 "ptb_value": ptb.ptb_value,
+                # Attribution
+                "binance_value": binance_value,
+                "chainlink_value": chainlink_value,
+                "binance_chainlink_gap": binance_chainlink_gap,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "fair_minus_best_bid": fair_minus_best_bid,
+                "best_ask_minus_fair": best_ask_minus_fair,
+                # Data age
+                "binance_age_ms": binance_age_ms,
+                "chainlink_age_ms": chainlink_age_ms,
+                "book_event_age_ms": book_event_age_ms,
             })
             self._sync_quotes_impl(state, desired, now_ms)
 
@@ -661,6 +820,17 @@ class LivePaperSession:
         self._max_pusd_reserved = 0.0
         self._last_rejection_reason = None
         self._portfolio_value_start = 0.0
+        self._decisions_triggered_by_market = 0
+        self._decisions_triggered_by_rtds = 0
+        self._decisions_ptb_locked = 0
+        self._decisions_bid_enabled = 0
+        self._decisions_ask_enabled = 0
+        self._binance_ages = []
+        self._chainlink_ages = []
+        self._book_event_ages = []
+        self._abs_gaps = []
+        self._fair_minus_bid_samples = []
+        self._ask_minus_fair_samples = []
 
     @staticmethod
     def _dedup_key_from(fair: FairValueSnapshot, dq: DesiredQuotes) -> tuple:
