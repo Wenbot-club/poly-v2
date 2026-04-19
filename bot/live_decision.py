@@ -254,7 +254,7 @@ class LiveDecisionSession:
 
         try:
             fair = self._fair_engine.compute(state, now_ms)
-        except Exception as exc:
+        except RuntimeError as exc:
             self._skipped_fair_count += 1
             self._last_fair_error = str(exc)
             return
