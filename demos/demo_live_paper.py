@@ -69,11 +69,21 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"  last_fair_value_error     : {summary.last_fair_value_error}")
 
     print("\n  [paper execution]")
-    print(f"  orders_posted    : {summary.orders_posted}")
-    print(f"  orders_cancelled : {summary.orders_cancelled}")
-    print(f"  orders_rejected  : {summary.orders_rejected}")
-    print(f"  fills_simulated  : {summary.fills_simulated}")
-    print(f"  last_rejection   : {summary.last_rejection_reason}")
+    print(f"  orders_posted         : {summary.orders_posted}")
+    print(f"  orders_cancelled      : {summary.orders_cancelled}")
+    print(f"  orders_rejected       : {summary.orders_rejected}")
+    print(f"  fills_simulated       : {summary.fills_simulated}")
+    print(f"  filled_orders         : {summary.filled_orders}")
+    print(f"  last_rejection        : {summary.last_rejection_reason}")
+
+    print("\n  [derived metrics]")
+    print(f"  fill_rate             : {summary.fill_rate}")
+    print(f"  rejection_rate        : {summary.rejection_rate}")
+    print(f"  cancel_to_post_ratio  : {summary.cancel_to_post_ratio}")
+    print(f"  max_up_inventory      : {round(summary.max_up_inventory, 6)}")
+    print(f"  max_pusd_reserved     : {round(summary.max_pusd_reserved, 4)}")
+    print(f"  first_fill_ts_ms      : {summary.first_fill_ts_ms}")
+    print(f"  last_fill_ts_ms       : {summary.last_fill_ts_ms}")
 
     print("\n  [final inventory]")
     print(f"  pusd_free  : {round(summary.final_pusd_free, 4)}")
@@ -88,7 +98,7 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"{'=' * 60}")
 
 
-async def run_demo(duration: int) -> None:
+async def run_demo(duration: int, journal_out: str | None = None) -> None:
     print(f"{'=' * 60}")
     print("  Conservative paper execution demo")
     print(f"  Market  : Polymarket CLOB WebSocket")
@@ -123,6 +133,11 @@ async def run_demo(duration: int) -> None:
 
         _print_summary(summary)
 
+        if journal_out is not None:
+            from bot.paper_journal import write_jsonl
+            lines = write_jsonl(session.events, journal_out)
+            print(f"\n[journal] {lines} events written → {journal_out}")
+
         if session.state is not None:
             state = session.state
             print(f"\n[state] open_orders      : {len(state.open_orders)}")
@@ -144,10 +159,16 @@ def main(argv: list[str] | None = None) -> None:
         metavar="SECONDS",
         help="How long to listen (default: 10)",
     )
+    parser.add_argument(
+        "--journal-out",
+        metavar="PATH",
+        default=None,
+        help="Write session events as JSONL to this path (optional)",
+    )
     args = parser.parse_args(argv)
 
     try:
-        asyncio.run(run_demo(args.duration))
+        asyncio.run(run_demo(args.duration, journal_out=args.journal_out))
     except KeyboardInterrupt:
         print("\n[interrupted] Ctrl+C — exiting cleanly.")
 

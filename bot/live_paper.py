@@ -19,6 +19,11 @@ Execution pattern:
   Each poll with state change (regardless of decision dedup):
     → _check_fills() simulates fill when top_ask.price <= live_bid.price (conservative)
 
+Peak tracking:
+  _update_peaks() is called inside _drain_user_queue() after every state mutation.
+  This ensures max_pusd_reserved captures the reservation from post_order before
+  any fill releases it, and max_up_inventory captures the peak after fills.
+
 Price anchor: FairValueEngine.compute() raises RuntimeError when last_chainlink is None.
 Caught as RuntimeError only — other exceptions propagate. Counted in skipped_fair_value_count.
 
@@ -28,11 +33,16 @@ Polymarket RTDS feed (wss://ws-live-data.polymarket.com, topic crypto_prices_cha
 no auth) populate last_chainlink natively via RTDSMessageRouter. Not on-chain Chainlink.
 
 No real orders, no real fills, no PnL (no outcome available). Honest counters only.
+
+Event log:
+  session.events is a list[dict] populated during run_for(). Call
+  paper_journal.write_jsonl(session.events, path) after run_for() to persist.
+  run_for() never writes to disk itself.
 """
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
 from .async_runner import QueueingUserRouter
@@ -57,18 +67,32 @@ from .strategy.base import Strategy
 class LivePaperSummary:
     market: LiveReadonlySummary
     rtds: LiveRTDSSummary
+    # Decision layer
     decision_count: int
     first_decision_ts_ms: Optional[int]
     last_decision_ts_ms: Optional[int]
     skipped_fair_value_count: int
     last_fair_value_error: Optional[str]
+    # Execution counters
     orders_posted: int
     orders_cancelled: int
     orders_rejected: int
     fills_simulated: int
+    filled_orders: int          # unique order_ids with ≥1 fill
+    last_rejection_reason: Optional[str]
+    # Derived ratios (None when denominator == 0)
+    fill_rate: Optional[float]              # filled_orders / orders_posted
+    rejection_rate: Optional[float]         # orders_rejected / (orders_posted + orders_rejected)
+    cancel_to_post_ratio: Optional[float]   # orders_cancelled / orders_posted
+    # Peak inventory (tracked live via _update_peaks after each _drain_user_queue)
+    max_up_inventory: float
+    max_pusd_reserved: float
+    # Fill timestamps
+    first_fill_ts_ms: Optional[int]
+    last_fill_ts_ms: Optional[int]
+    # Final inventory
     final_pusd_free: float
     final_up_free: float
-    last_rejection_reason: Optional[str]
 
 
 class LivePaperSession:
@@ -85,6 +109,9 @@ class LivePaperSession:
     defaults to MockExecutionEngine(config, user_router=queueing_router).
 
     FairValueEngine and PTBLocker are injectable for tests.
+
+    After run_for(), session.events holds the ordered event log. Pass it to
+    paper_journal.write_jsonl() to persist — run_for() never writes to disk.
     """
 
     def __init__(
@@ -120,6 +147,7 @@ class LivePaperSession:
 
         self.state: Optional[LocalState] = None
         self.decisions: list[DecisionSnapshot] = []
+        self.events: list[dict] = []
 
         # Per-run state; reset in _reset_run_state()
         self._user_queue: Optional[asyncio.Queue] = None
@@ -133,6 +161,11 @@ class LivePaperSession:
         self._orders_cancelled: int = 0
         self._orders_rejected: int = 0
         self._fills_simulated: int = 0
+        self._filled_order_ids: set[str] = set()
+        self._first_fill_ts_ms: Optional[int] = None
+        self._last_fill_ts_ms: Optional[int] = None
+        self._max_up_inventory: float = 0.0
+        self._max_pusd_reserved: float = 0.0
         self._last_rejection_reason: Optional[str] = None
 
     # ---------------------------------------------------------------------- #
@@ -146,6 +179,9 @@ class LivePaperSession:
         Decision loop runs as a background task, cancelled when feeds finish.
         Final synchronous pass after cancellation catches state changes that
         arrived after the last poll interval.
+
+        After this returns, session.events holds the ordered JSONL-ready event log.
+        Call paper_journal.write_jsonl(session.events, path) to persist it.
         """
         market = await self._discovery.find_active_btc_15m_market()
         state = StateFactory(self._config).create(market)
@@ -196,6 +232,15 @@ class LivePaperSession:
                 pass
             self._poll_and_execute(state, utc_now_ms())
 
+        posted = self._orders_posted
+        filled = len(self._filled_order_ids)
+        rejected = self._orders_rejected
+        cancelled = self._orders_cancelled
+
+        fill_rate = filled / posted if posted > 0 else None
+        rejection_rate = rejected / (posted + rejected) if (posted + rejected) > 0 else None
+        cancel_to_post_ratio = cancelled / posted if posted > 0 else None
+
         first_ts = self.decisions[0].now_ms if self.decisions else None
         last_ts = self.decisions[-1].now_ms if self.decisions else None
 
@@ -207,10 +252,18 @@ class LivePaperSession:
             last_decision_ts_ms=last_ts,
             skipped_fair_value_count=self._skipped_fair_count,
             last_fair_value_error=self._last_fair_error,
-            orders_posted=self._orders_posted,
-            orders_cancelled=self._orders_cancelled,
-            orders_rejected=self._orders_rejected,
+            orders_posted=posted,
+            orders_cancelled=cancelled,
+            orders_rejected=rejected,
             fills_simulated=self._fills_simulated,
+            filled_orders=filled,
+            fill_rate=fill_rate,
+            rejection_rate=rejection_rate,
+            cancel_to_post_ratio=cancel_to_post_ratio,
+            max_up_inventory=self._max_up_inventory,
+            max_pusd_reserved=self._max_pusd_reserved,
+            first_fill_ts_ms=self._first_fill_ts_ms,
+            last_fill_ts_ms=self._last_fill_ts_ms,
             final_pusd_free=state.inventory.pusd_free,
             final_up_free=state.inventory.up_free,
             last_rejection_reason=self._last_rejection_reason,
@@ -333,6 +386,18 @@ class LivePaperSession:
                     ptb_value=ptb.ptb_value,
                 )
             )
+            self.events.append({
+                "ts_ms": now_ms,
+                "event": "decision",
+                "trigger": trigger,
+                "p_up": round(fair.p_up, 6),
+                "bid_price": desired.bid.price,
+                "bid_enabled": desired.bid.enabled,
+                "ask_price": desired.ask.price,
+                "ask_enabled": desired.ask.enabled,
+                "ptb_locked": ptb.locked,
+                "ptb_value": ptb.ptb_value,
+            })
             self._sync_quotes_impl(state, desired, now_ms)
 
         self._check_fills(state, now_ms)
@@ -366,9 +431,26 @@ class LivePaperSession:
                 )
                 if order_id is None:
                     self._orders_rejected += 1
-                    self._capture_rejection_reason(state)
+                    reason = self._extract_rejection_reason(state)
+                    self._last_rejection_reason = reason
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_rejected",
+                        "side": desired.bid.side,
+                        "price": desired.bid.price,
+                        "size": desired.bid.size,
+                        "reason": reason,
+                    })
                 else:
                     self._orders_posted += 1
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_posted",
+                        "order_id": order_id,
+                        "side": desired.bid.side,
+                        "price": desired.bid.price,
+                        "size": desired.bid.size,
+                    })
                 self._drain_user_queue(state)
             else:
                 remaining = current_bid.remaining
@@ -385,6 +467,12 @@ class LivePaperSession:
                     self._drain_user_queue(state)
                     if cancel_action is not None:
                         self._orders_cancelled += 1
+                        self.events.append({
+                            "ts_ms": now_ms,
+                            "event": "order_cancelled",
+                            "order_id": current_bid_id,
+                            "reason": "reprice",
+                        })
                     order_id = self._engine.post_order(
                         state,
                         asset_id=state.market.yes_token_id,
@@ -396,9 +484,26 @@ class LivePaperSession:
                     )
                     if order_id is None:
                         self._orders_rejected += 1
-                        self._capture_rejection_reason(state)
+                        reason = self._extract_rejection_reason(state)
+                        self._last_rejection_reason = reason
+                        self.events.append({
+                            "ts_ms": now_ms,
+                            "event": "order_rejected",
+                            "side": desired.bid.side,
+                            "price": desired.bid.price,
+                            "size": desired.bid.size,
+                            "reason": reason,
+                        })
                     else:
                         self._orders_posted += 1
+                        self.events.append({
+                            "ts_ms": now_ms,
+                            "event": "order_posted",
+                            "order_id": order_id,
+                            "side": desired.bid.side,
+                            "price": desired.bid.price,
+                            "size": desired.bid.size,
+                        })
                     self._drain_user_queue(state)
         else:
             if current_bid is not None:
@@ -408,6 +513,12 @@ class LivePaperSession:
                 self._drain_user_queue(state)
                 if cancel_action is not None:
                     self._orders_cancelled += 1
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_cancelled",
+                        "order_id": current_bid_id,
+                        "reason": "bid_disabled",
+                    })
 
     def _check_fills(self, state: LocalState, now_ms: int) -> None:
         """
@@ -422,29 +533,50 @@ class LivePaperSession:
         top_ask = state.yes_book.top_ask()
         if top_ask is not None and top_ask.price <= order.price:
             fill_size = min(order.remaining, top_ask.size)
+            fill_price = order.price
             actions = self._engine.simulate_fill(
                 state, order_id=bid_id, fill_size=fill_size, now_ms=now_ms
             )
             self._drain_user_queue(state)
             if actions:
                 self._fills_simulated += 1
+                self._filled_order_ids.add(bid_id)
+                if self._first_fill_ts_ms is None:
+                    self._first_fill_ts_ms = now_ms
+                self._last_fill_ts_ms = now_ms
+                self.events.append({
+                    "ts_ms": now_ms,
+                    "event": "fill_simulated",
+                    "order_id": bid_id,
+                    "fill_price": fill_price,
+                    "fill_size": fill_size,
+                })
 
     def _drain_user_queue(self, state: LocalState) -> None:
-        """Apply all pending user queue messages to state synchronously."""
+        """Apply all pending user queue messages to state, then update peak inventory."""
         assert self._user_queue is not None
         while not self._user_queue.empty():
             msg = self._user_queue.get_nowait()
             self._user_router.apply(state, msg)
+        self._update_peaks(state)
 
-    def _capture_rejection_reason(self, state: LocalState) -> None:
-        """Read rejection reason from the most recent warn log after post_order() → None."""
+    def _update_peaks(self, state: LocalState) -> None:
+        up = state.inventory.up_free
+        reserved = state.inventory.pusd_reserved_for_bids
+        if up > self._max_up_inventory:
+            self._max_up_inventory = up
+        if reserved > self._max_pusd_reserved:
+            self._max_pusd_reserved = reserved
+
+    def _extract_rejection_reason(self, state: LocalState) -> str:
+        """Read canonical rejection reason from the last warn log after post_order() → None."""
         if state.logs and state.logs[-1].message == "mock_order_rejected":
-            self._last_rejection_reason = str(
-                state.logs[-1].payload.get("reason", "unknown")
-            )
+            return str(state.logs[-1].payload.get("reason", "unknown"))
+        return "unknown"
 
     def _reset_run_state(self) -> None:
         self.decisions = []
+        self.events = []
         self._user_queue = None
         self._engine = None
         self._last_binance_seq = None
@@ -456,6 +588,11 @@ class LivePaperSession:
         self._orders_cancelled = 0
         self._orders_rejected = 0
         self._fills_simulated = 0
+        self._filled_order_ids = set()
+        self._first_fill_ts_ms = None
+        self._last_fill_ts_ms = None
+        self._max_up_inventory = 0.0
+        self._max_pusd_reserved = 0.0
         self._last_rejection_reason = None
 
     @staticmethod

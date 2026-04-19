@@ -544,3 +544,195 @@ def test_skipped_count_zero_with_chainlink_anchor_paper():
     summary = asyncio.run(session.run_for(duration=5))
     assert summary.skipped_fair_value_count == 0
     assert summary.last_fair_value_error is None
+
+
+# ---------------------------------------------------------------------------
+# PR #10 — enriched metrics
+# ---------------------------------------------------------------------------
+
+def test_fill_rate_is_filled_orders_over_posted():
+    """fill_rate = filled_orders / orders_posted; one full fill → 1.0."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.fills_simulated >= 1
+    assert summary.filled_orders >= 1
+    assert summary.orders_posted >= 1
+    assert summary.fill_rate is not None
+    assert abs(summary.fill_rate - summary.filled_orders / summary.orders_posted) < 1e-10
+
+
+def test_fill_rate_none_when_no_orders_posted():
+    session = _make_session([], [])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted == 0
+    assert summary.fill_rate is None
+
+
+def test_filled_orders_counts_unique_order_ids():
+    """Two partial fills on the same order → filled_orders == 1, fills_simulated == 2."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52, ask_size=25.0),   # no cross
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45, ask_size=3.0),    # partial fill (3)
+        _book_msg("YES_TOKEN", ts=300, ask_price=0.44, ask_size=3.0),    # partial fill (3)
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.fills_simulated == 2
+    assert summary.filled_orders == 1
+
+
+def test_rejection_rate_computed_correctly():
+    """All attempts rejected (capital=0) → rejection_rate == 1.0."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=0.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_rejected >= 1
+    assert summary.rejection_rate is not None
+    assert abs(summary.rejection_rate - 1.0) < 1e-10
+
+
+def test_rejection_rate_none_when_no_orders():
+    session = _make_session([], [])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted == 0
+    assert summary.orders_rejected == 0
+    assert summary.rejection_rate is None
+
+
+def test_cancel_to_post_ratio_computed_correctly():
+    """Reprice (bid price changes between decisions) → cancel + re-post → ratio correct."""
+
+    class _FakeStrategyReprice:
+        def build(self, state, fair, now_ms):
+            price = 0.47 if state.yes_book.timestamp_ms > 100 else 0.48
+            return DesiredQuotes(
+                bid=DesiredOrder(enabled=True, side="BUY", price=price, size=10.0, reason="test"),
+                ask=DesiredOrder(enabled=True, side="SELL", price=0.55, size=10.0, reason="test"),
+                mode="passive",
+                inventory_skew=0.0,
+                timestamp_ms=state.yes_book.timestamp_ms,
+            )
+
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.52),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=_FakeStrategyReprice(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_cancelled >= 1
+    assert summary.orders_posted >= 1
+    assert summary.cancel_to_post_ratio is not None
+    expected = summary.orders_cancelled / summary.orders_posted
+    assert abs(summary.cancel_to_post_ratio - expected) < 1e-10
+
+
+def test_max_up_inventory_nonzero_after_fill():
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.fills_simulated >= 1:
+        assert summary.max_up_inventory > 0.0
+
+
+def test_peaks_updated_after_post_before_fill():
+    """max_pusd_reserved is captured by _drain_user_queue even with no fill."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]  # ask does not cross bid
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted >= 1
+    assert summary.fills_simulated == 0
+    assert summary.max_pusd_reserved > 0.0
+
+
+def test_first_and_last_fill_ts_ms_populated():
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.fills_simulated >= 1:
+        assert summary.first_fill_ts_ms is not None
+        assert summary.last_fill_ts_ms is not None
+        assert isinstance(summary.first_fill_ts_ms, int)
+        assert isinstance(summary.last_fill_ts_ms, int)
+
+
+def test_events_contain_decision_and_order_posted():
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    asyncio.run(session.run_for(duration=5))
+    event_types = {e["event"] for e in session.events}
+    assert "decision" in event_types
+    assert "order_posted" in event_types
+
+
+def test_write_jsonl_writes_correct_line_count():
+    import tempfile
+    from pathlib import Path as _Path
+    from bot.paper_journal import write_jsonl
+
+    events = [
+        {"ts_ms": 100, "event": "decision", "trigger": "market"},
+        {"ts_ms": 200, "event": "order_posted", "order_id": "mock-1"},
+        {"ts_ms": 300, "event": "fill_simulated", "order_id": "mock-1"},
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _Path(tmpdir) / "subdir" / "session.jsonl"
+        lines = write_jsonl(events, path)
+        assert lines == 3
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        assert content.count("\n") == 3
