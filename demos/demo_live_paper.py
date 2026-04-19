@@ -86,8 +86,21 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"  last_fill_ts_ms       : {summary.last_fill_ts_ms}")
 
     print("\n  [final inventory]")
-    print(f"  pusd_free  : {round(summary.final_pusd_free, 4)}")
-    print(f"  up_free    : {round(summary.final_up_free, 6)}")
+    print(f"  pusd_free      : {round(summary.final_pusd_free, 4)}")
+    print(f"  pusd_reserved  : {round(summary.final_pusd_reserved, 4)}")
+    print(f"  up_free        : {round(summary.final_up_free, 6)}")
+
+    print("\n  [mark-to-market PnL]")
+    print(f"  mark_source             : {summary.mark_source}")
+    print(f"  mark_price              : {summary.mark_price}")
+    print(f"  portfolio_value_start   : {round(summary.portfolio_value_start, 4)}")
+    pve = summary.portfolio_value_end_mark
+    print(f"  portfolio_value_end_mark: {round(pve, 4) if pve is not None else None}")
+    ptm = summary.pnl_total_mark
+    pum = summary.pnl_unrealized_mark
+    print(f"  pnl_total_mark          : {round(ptm, 4) if ptm is not None else None}")
+    print(f"  pnl_unrealized_mark     : {round(pum, 4) if pum is not None else None}")
+    print(f"  cost_basis              : {round(summary.cost_basis, 4)}")
 
     if summary.skipped_fair_value_count > 0 and summary.decision_count == 0:
         print(
