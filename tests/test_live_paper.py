@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from typing import Callable
+
 from bot.domain import (
     ClobMarketInfo,
     ClobToken,
@@ -12,6 +14,7 @@ from bot.domain import (
     FairValueSnapshot,
     LocalState,
     MarketContext,
+    PTBDecision,
 )
 from bot.live_paper import LivePaperSession, LivePaperSummary
 from bot.settings import DEFAULT_CONFIG
@@ -208,6 +211,24 @@ class FakeStrategy:
         return self._quotes
 
 
+class FakePTBLocker:
+    def __init__(self, locked: bool = False, ptb_value: Optional[float] = None) -> None:
+        self._locked = locked
+        self._ptb_value = ptb_value
+
+    def try_lock(self, state: LocalState, now_ms: int) -> PTBDecision:
+        return PTBDecision(
+            locked=self._locked,
+            ptb_value=self._ptb_value,
+            selected_tick=None,
+            used_prestart_grace=False,
+            collision_detected=False,
+            collision_ticks=[],
+            reason="fake",
+            decision_ts_ms=now_ms,
+        )
+
+
 def _make_session(
     market_messages: List[Dict[str, Any]],
     rtds_ticks: List[Dict[str, Any]],
@@ -216,7 +237,14 @@ def _make_session(
     discovery: Optional[FakeDiscoveryProvider] = None,
     initial_pusd: Optional[float] = None,
     decision_poll_ms: int = 100,
+    ptb_locker: Optional[Any] = None,
+    now_fn: Optional[Callable[[], int]] = None,
 ) -> LivePaperSession:
+    kwargs: Dict[str, Any] = {}
+    if ptb_locker is not None:
+        kwargs["ptb_locker"] = ptb_locker
+    if now_fn is not None:
+        kwargs["now_fn"] = now_fn
     return LivePaperSession(
         discovery=discovery or FakeDiscoveryProvider(),
         market_provider=FakeMarketDataProvider(market_messages),
@@ -226,6 +254,7 @@ def _make_session(
         config=DEFAULT_CONFIG,
         initial_pusd=initial_pusd,
         decision_poll_ms=decision_poll_ms,
+        **kwargs,
     )
 
 
@@ -856,3 +885,165 @@ def test_session_end_event_in_journal():
     assert "mark_source" in end
     assert end["mark_source"] == "yes_book_top_bid"
     assert "pusd_reserved" in end
+
+
+# ---------------------------------------------------------------------------
+# Attribution and age metrics (PR #12)
+# ---------------------------------------------------------------------------
+
+def test_binance_age_ms_at_decision_computed_from_recv_timestamp():
+    """age = now_ms - last_binance.recv_timestamp_ms, verified with fixed now_fn."""
+    # ts=1_000_000 → recv_timestamp_ms = ts + 50 = 1_000_050
+    tick = _binance_tick(84000.0, seq=1, ts=1_000_000)
+    FIXED_NOW = 1_000_250  # age = 1_000_250 - 1_000_050 = 200
+    session = _make_session([], [tick], now_fn=lambda: FIXED_NOW)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.avg_binance_age_ms_at_decision == 200.0
+    assert summary.max_binance_age_ms_at_decision == 200
+
+
+def test_chainlink_age_ms_at_decision_computed_from_recv_timestamp():
+    """chainlink first → in state before binance triggers decision."""
+    # chainlink recv_ts = 900_000 + 50 = 900_050 → age = 1_000_250 - 900_050 = 100_200
+    cl_tick = _chainlink_tick(84100.0, seq=1, ts=900_000)
+    b_tick = _binance_tick(84000.0, seq=1, ts=1_000_000)  # recv = 1_000_050
+    FIXED_NOW = 1_000_250
+    session = _make_session([], [cl_tick, b_tick], now_fn=lambda: FIXED_NOW)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.avg_chainlink_age_ms_at_decision == 1_000_250 - 900_050
+    assert summary.max_chainlink_age_ms_at_decision == 1_000_250 - 900_050
+
+
+def test_book_event_age_ms_at_decision_computed_from_book_timestamp():
+    """book_event_age_ms = now_ms - yes_book.timestamp_ms."""
+    BOOK_TS = 1_000_000
+    FIXED_NOW = 1_000_300  # age = 300
+    msgs = [_book_msg("YES_TOKEN", ts=BOOK_TS, bid_price=0.46, ask_price=0.52)]
+    session = _make_session(msgs, [], now_fn=lambda: FIXED_NOW)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.avg_book_event_age_ms_at_decision == 300.0
+    assert summary.max_book_event_age_ms_at_decision == 300
+
+
+def test_decision_trigger_counters_split_market_vs_rtds():
+    """market trigger when book updates; rtds trigger when binance updates."""
+    # Session 1: book only → trigger = "market"
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    s1 = _make_session(msgs, [])
+    sum1 = asyncio.run(s1.run_for(duration=5))
+    assert sum1.decisions_triggered_by_market >= 1
+    assert sum1.decisions_triggered_by_rtds == 0
+
+    # Session 2: binance only → trigger = "rtds"
+    tick = _binance_tick(84000.0, seq=1)
+    s2 = _make_session([], [tick])
+    sum2 = asyncio.run(s2.run_for(duration=5))
+    assert sum2.decisions_triggered_by_rtds >= 1
+    assert sum2.decisions_triggered_by_market == 0
+
+
+def test_decisions_ptb_locked_counted():
+    """decisions_ptb_locked increments when PTBLocker returns locked=True."""
+    tick = _binance_tick(84000.0, seq=1)
+    session = _make_session([], [tick], ptb_locker=FakePTBLocker(locked=True, ptb_value=84000.0))
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.decision_count >= 1
+    assert summary.decisions_ptb_locked == summary.decision_count
+
+
+def test_decisions_bid_and_ask_enabled_counted():
+    """bid/ask enabled counters match decisions when both sides are enabled."""
+    tick = _binance_tick(84000.0, seq=1)
+    session = _make_session([], [tick])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.decision_count >= 1
+    assert summary.decisions_bid_enabled == summary.decision_count
+    assert summary.decisions_ask_enabled == summary.decision_count
+
+
+def test_binance_chainlink_gap_logged_in_decision_event():
+    """decision event includes binance_chainlink_gap = binance_value - chainlink_value."""
+    cl_tick = _chainlink_tick(84100.0, seq=1)
+    b_tick = _binance_tick(84000.0, seq=1)
+    session = _make_session([], [cl_tick, b_tick])
+    asyncio.run(session.run_for(duration=5))
+    decision_events = [e for e in session.events if e.get("event") == "decision"]
+    assert len(decision_events) >= 1
+    ev = decision_events[-1]
+    assert ev["binance_value"] == 84000.0
+    assert ev["chainlink_value"] == 84100.0
+    assert abs(ev["binance_chainlink_gap"] - (84000.0 - 84100.0)) < 1e-9
+
+
+def test_fair_minus_best_bid_logged_in_decision_event():
+    """fair_minus_best_bid = fair.p_up - best_bid."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    fair = _make_fair_snapshot(p_up=0.52)
+    session = _make_session(msgs, [], fair_engine=FakeFairValueEngine(fair))
+    asyncio.run(session.run_for(duration=5))
+    decision_events = [e for e in session.events if e.get("event") == "decision"]
+    assert len(decision_events) >= 1
+    ev = decision_events[-1]
+    assert ev["best_bid"] == 0.46
+    assert abs(ev["fair_minus_best_bid"] - (0.52 - 0.46)) < 1e-9
+
+
+def test_best_ask_minus_fair_logged_in_decision_event():
+    """best_ask_minus_fair = best_ask - fair.p_up."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.60)]
+    fair = _make_fair_snapshot(p_up=0.52)
+    session = _make_session(msgs, [], fair_engine=FakeFairValueEngine(fair))
+    asyncio.run(session.run_for(duration=5))
+    decision_events = [e for e in session.events if e.get("event") == "decision"]
+    assert len(decision_events) >= 1
+    ev = decision_events[-1]
+    assert ev["best_ask"] == 0.60
+    assert abs(ev["best_ask_minus_fair"] - (0.60 - 0.52)) < 1e-9
+
+
+def test_session_end_contains_age_and_attribution_aggregates():
+    """session_end event includes all attribution and age aggregate fields."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    session = _make_session(msgs, [])
+    asyncio.run(session.run_for(duration=5))
+    end = session.events[-1]
+    assert end["event"] == "session_end"
+    for key in (
+        "decisions_triggered_by_market", "decisions_triggered_by_rtds",
+        "decisions_ptb_locked", "decisions_bid_enabled", "decisions_ask_enabled",
+        "avg_binance_age_ms_at_decision", "max_binance_age_ms_at_decision",
+        "avg_chainlink_age_ms_at_decision", "max_chainlink_age_ms_at_decision",
+        "avg_book_event_age_ms_at_decision", "max_book_event_age_ms_at_decision",
+        "avg_abs_binance_chainlink_gap_at_decision", "max_abs_binance_chainlink_gap_at_decision",
+        "avg_fair_minus_best_bid_at_decision", "avg_best_ask_minus_fair_at_decision",
+    ):
+        assert key in end, f"missing key: {key}"
+
+
+def test_age_metrics_none_when_no_decisions():
+    """All age/attribution aggregates are None when no decisions fired."""
+    session = _make_session([], [])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.decision_count == 0
+    assert summary.avg_binance_age_ms_at_decision is None
+    assert summary.max_binance_age_ms_at_decision is None
+    assert summary.avg_chainlink_age_ms_at_decision is None
+    assert summary.max_chainlink_age_ms_at_decision is None
+    assert summary.avg_book_event_age_ms_at_decision is None
+    assert summary.max_book_event_age_ms_at_decision is None
+    assert summary.avg_abs_binance_chainlink_gap_at_decision is None
+    assert summary.max_abs_binance_chainlink_gap_at_decision is None
+    assert summary.avg_fair_minus_best_bid_at_decision is None
+    assert summary.avg_best_ask_minus_fair_at_decision is None
+
+
+def test_gap_metrics_none_when_chainlink_missing():
+    """binance_chainlink_gap and its aggregates are None without chainlink data."""
+    tick = _binance_tick(84000.0, seq=1)
+    session = _make_session([], [tick])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.decision_count >= 1
+    assert summary.avg_abs_binance_chainlink_gap_at_decision is None
+    assert summary.max_abs_binance_chainlink_gap_at_decision is None
+    decision_events = [e for e in session.events if e.get("event") == "decision"]
+    assert all(e["binance_chainlink_gap"] is None for e in decision_events)
