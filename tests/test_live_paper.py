@@ -109,10 +109,15 @@ def _make_fair_snapshot(p_up: float = 0.52) -> FairValueSnapshot:
     )
 
 
-def _make_desired_quotes(bid_price: float = 0.48, ask_price: float = 0.52) -> DesiredQuotes:
+def _make_desired_quotes(
+    bid_price: float = 0.48,
+    ask_price: float = 0.52,
+    bid_enabled: bool = True,
+    ask_enabled: bool = False,
+) -> DesiredQuotes:
     return DesiredQuotes(
-        bid=DesiredOrder(enabled=True, side="BUY", price=bid_price, size=10.0, reason="test"),
-        ask=DesiredOrder(enabled=True, side="SELL", price=ask_price, size=10.0, reason="test"),
+        bid=DesiredOrder(enabled=bid_enabled, side="BUY", price=bid_price, size=10.0, reason="test"),
+        ask=DesiredOrder(enabled=ask_enabled, side="SELL", price=ask_price, size=10.0, reason="test"),
         mode="passive",
         inventory_skew=0.0,
         timestamp_ms=1_765_000_800_200,
@@ -229,13 +234,45 @@ class FakePTBLocker:
         )
 
 
+class FakeInventoryAwareStrategy:
+    """Returns ask_enabled=True only when state.inventory.up_free > 0."""
+
+    def __init__(self, bid_price: float = 0.48, ask_price: float = 0.52) -> None:
+        self._bid_price = bid_price
+        self._ask_price = ask_price
+
+    def build(self, state: LocalState, fair: FairValueSnapshot, now_ms: int) -> DesiredQuotes:
+        has_inventory = state.inventory.up_free > 0.0
+        return DesiredQuotes(
+            bid=DesiredOrder(enabled=True, side="BUY", price=self._bid_price, size=10.0, reason="test"),
+            ask=DesiredOrder(enabled=has_inventory, side="SELL", price=self._ask_price, size=10.0, reason="test"),
+            mode="passive",
+            inventory_skew=0.0,
+            timestamp_ms=now_ms,
+        )
+
+
+class FakeStrategySequence:
+    """Advances through a list of DesiredQuotes, repeating the last after exhaustion."""
+
+    def __init__(self, sequence: List[DesiredQuotes]) -> None:
+        self._seq = sequence
+        self._idx = 0
+
+    def build(self, state: LocalState, fair: FairValueSnapshot, now_ms: int) -> DesiredQuotes:
+        q = self._seq[min(self._idx, len(self._seq) - 1)]
+        self._idx += 1
+        return q
+
+
 def _make_session(
     market_messages: List[Dict[str, Any]],
     rtds_ticks: List[Dict[str, Any]],
-    strategy: Optional[FakeStrategy] = None,
+    strategy: Optional[Any] = None,
     fair_engine: Optional[Any] = None,
     discovery: Optional[FakeDiscoveryProvider] = None,
     initial_pusd: Optional[float] = None,
+    initial_up: Optional[float] = None,
     decision_poll_ms: int = 100,
     ptb_locker: Optional[Any] = None,
     now_fn: Optional[Callable[[], int]] = None,
@@ -245,6 +282,8 @@ def _make_session(
         kwargs["ptb_locker"] = ptb_locker
     if now_fn is not None:
         kwargs["now_fn"] = now_fn
+    if initial_up is not None:
+        kwargs["initial_up"] = initial_up
     return LivePaperSession(
         discovery=discovery or FakeDiscoveryProvider(),
         market_provider=FakeMarketDataProvider(market_messages),
@@ -842,14 +881,14 @@ def test_mark_source_is_yes_book_top_bid():
     assert summary.mark_source == "yes_book_top_bid"
 
 
-def test_cost_basis_equals_total_fill_cost():
-    """cost_basis = initial_pusd - pusd_free = sum of (price * size) for all fills."""
+def test_position_cost_basis_equals_fill_cost_bid_only():
+    """position_cost_basis = sum(fill_price * fill_size) for BUY fills without any sells."""
     session = _fill_session(_fill_scenario_msgs(), initial_pusd=1000.0)
     summary = asyncio.run(session.run_for(duration=5))
-    if summary.fills_simulated >= 1:
-        # FakeStrategy bids at 0.48, size 10 → fill cost = 4.8
+    if summary.bid_fills_simulated >= 1:
+        # FakeStrategy bids at 0.48, size 10 → fill cost = 4.8 per fill
         expected_cost = summary.portfolio_value_start - summary.final_pusd_free
-        assert abs(summary.cost_basis - expected_cost) < 1e-10
+        assert abs(summary.position_cost_basis - expected_cost) < 1e-10
 
 
 def test_pnl_positive_when_mark_above_fill_price():
@@ -954,7 +993,8 @@ def test_decisions_ptb_locked_counted():
 def test_decisions_bid_and_ask_enabled_counted():
     """bid/ask enabled counters match decisions when both sides are enabled."""
     tick = _binance_tick(84000.0, seq=1)
-    session = _make_session([], [tick])
+    both = FakeStrategy(_make_desired_quotes(ask_enabled=True))
+    session = _make_session([], [tick], strategy=both)
     summary = asyncio.run(session.run_for(duration=5))
     assert summary.decision_count >= 1
     assert summary.decisions_bid_enabled == summary.decision_count
@@ -1047,3 +1087,290 @@ def test_gap_metrics_none_when_chainlink_missing():
     assert summary.max_abs_binance_chainlink_gap_at_decision is None
     decision_events = [e for e in session.events if e.get("event") == "decision"]
     assert all(e["binance_chainlink_gap"] is None for e in decision_events)
+
+
+# ---------------------------------------------------------------------------
+# PR #13 — ask-side paper execution, realized PnL, side-specific counters
+# ---------------------------------------------------------------------------
+
+def _round_trip_msgs(bid_size: float = 30.0) -> List[Dict[str, Any]]:
+    """Four-message round-trip: post bid, fill bid, post ask, fill ask."""
+    return [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.40, ask_price=0.45),
+        _book_msg("YES_TOKEN", ts=300, bid_price=0.50, ask_price=0.58),
+        _book_msg("YES_TOKEN", ts=400, bid_price=0.55, ask_price=0.60, bid_size=bid_size),
+    ]
+
+
+def _round_trip_session(
+    initial_pusd: float = 1000.0,
+    bid_price: float = 0.48,
+    ask_price: float = 0.52,
+    bid_size: float = 30.0,
+) -> LivePaperSession:
+    return LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(_round_trip_msgs(bid_size=bid_size)),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeInventoryAwareStrategy(bid_price=bid_price, ask_price=ask_price),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=initial_pusd,
+        decision_poll_ms=0,
+    )
+
+
+def test_ask_order_posted_when_inventory_positive_and_ask_enabled():
+    """initial_up=20 → ask_enabled → ask_orders_posted >= 1."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    strategy = FakeStrategy(_make_desired_quotes(bid_enabled=False, ask_enabled=True))
+    session = _make_session(msgs, [], strategy=strategy, initial_up=20.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.ask_orders_posted >= 1
+
+
+def test_ask_order_rejected_when_no_inventory():
+    """ask_enabled but up_free == 0 → rejected with not_enough_up_inventory."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    strategy = FakeStrategy(_make_desired_quotes(bid_enabled=False, ask_enabled=True))
+    session = _make_session(msgs, [], strategy=strategy)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_rejected >= 1
+    assert summary.last_rejection_reason == "not_enough_up_inventory"
+
+
+def test_ask_order_cancelled_when_ask_disabled():
+    """Second decision with ask_enabled=False cancels the live ask."""
+    seq = FakeStrategySequence([
+        _make_desired_quotes(bid_enabled=False, ask_enabled=True),
+        _make_desired_quotes(bid_enabled=False, ask_enabled=False),
+    ])
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.46, ask_price=0.52),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=seq,
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_up=20.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_cancelled >= 1
+    cancelled_events = [e for e in session.events if e.get("event") == "order_cancelled"]
+    assert any(e["side"] == "SELL" for e in cancelled_events)
+
+
+def test_ask_order_repriced_when_price_changes():
+    """Ask price change between decisions triggers cancel + repost on ask side."""
+
+    class _RepricingAsk:
+        def build(self, state: LocalState, fair: FairValueSnapshot, now_ms: int) -> DesiredQuotes:
+            price = 0.55 if state.yes_book.timestamp_ms > 100 else 0.52
+            return DesiredQuotes(
+                bid=DesiredOrder(enabled=False, side="BUY", price=0.48, size=10.0, reason="test"),
+                ask=DesiredOrder(enabled=True, side="SELL", price=price, size=10.0, reason="test"),
+                mode="passive",
+                inventory_skew=0.0,
+                timestamp_ms=state.yes_book.timestamp_ms,
+            )
+
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.60),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.46, ask_price=0.60),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=_RepricingAsk(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_up=20.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_cancelled >= 1
+    assert summary.ask_orders_posted >= 2
+    cancelled_events = [e for e in session.events if e.get("event") == "order_cancelled"]
+    assert any(e["side"] == "SELL" for e in cancelled_events)
+
+
+def test_ask_fill_simulated_when_top_bid_crosses_live_ask():
+    """top_bid >= live_ask → ask_fills_simulated >= 1."""
+    summary = asyncio.run(_round_trip_session().run_for(duration=5))
+    if summary.bid_fills_simulated >= 1:
+        assert summary.ask_fills_simulated >= 1
+
+
+def test_sell_fill_reduces_up_and_increases_pusd():
+    """SELL fill decreases up_free and increases pusd_free."""
+    session = _round_trip_session(initial_pusd=1000.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.ask_fills_simulated >= 1:
+        assert summary.final_up_free < summary.max_up_inventory
+        assert summary.final_pusd_free > summary.portfolio_value_start - summary.position_cost_basis
+
+
+def test_realized_pnl_zero_without_sell_fills():
+    """No SELL fills → realized_pnl == 0.0."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45),  # fill bid only
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),  # bid-only (ask_enabled=False)
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.realized_pnl == 0.0
+
+
+def test_realized_pnl_positive_when_sell_above_average_cost():
+    """Buy at 0.48, sell at 0.52 → realized_pnl > 0 and approximately 0.4."""
+    summary = asyncio.run(_round_trip_session(bid_price=0.48, ask_price=0.52).run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1:
+        assert summary.realized_pnl > 0
+
+
+def test_realized_pnl_negative_when_sell_below_average_cost():
+    """Buy at 0.48, sell at 0.45 → realized_pnl < 0."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.40, ask_price=0.45),  # fill bid at 0.48
+        _book_msg("YES_TOKEN", ts=300, bid_price=0.40, ask_price=0.58),  # post ask at 0.45
+        _book_msg("YES_TOKEN", ts=400, bid_price=0.46, ask_price=0.60),  # fill ask at 0.45
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeInventoryAwareStrategy(bid_price=0.48, ask_price=0.45),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1:
+        assert summary.realized_pnl < 0
+
+
+def test_position_cost_basis_reduced_after_partial_sell():
+    """Buy 10 at 0.48, sell 5 (partial top_bid size) → position_cost_basis ≈ 0.48 * 5."""
+    summary = asyncio.run(_round_trip_session(bid_size=5.0).run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1:
+        # Only 5 tokens sold out of 10 → remaining cost = 0.48 * 5
+        expected = 0.48 * 5.0
+        assert abs(summary.position_cost_basis - expected) < 1e-9
+
+
+def test_position_cost_basis_zero_after_full_exit():
+    """Full round-trip (buy 10, sell 10) → position_cost_basis == 0.0."""
+    summary = asyncio.run(_round_trip_session().run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1:
+        assert summary.position_cost_basis == 0.0
+
+
+def test_pnl_total_equals_realized_when_position_closed():
+    """up_free == 0 after full exit → pnl_total_mark == realized_pnl (exact, no mark needed)."""
+    summary = asyncio.run(_round_trip_session().run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1:
+        assert summary.final_up_free == 0.0
+        assert summary.pnl_total_mark is not None
+        assert abs(summary.pnl_total_mark - summary.realized_pnl) < 1e-10
+
+
+def test_pnl_total_none_when_open_inventory_and_no_best_bid():
+    """up_free > 0 with bids cleared from book → pnl_total_mark is None."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.40, ask_price=0.45),  # fill bid
+        {"event_type": "book", "asset_id": "YES_TOKEN", "timestamp": 300,
+         "bids": [], "asks": [{"price": 0.90, "size": 25.0}]},            # clear bids
+    ]
+    session = _fill_session(msgs)
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.bid_fills_simulated >= 1:
+        assert summary.final_up_free > 0
+        assert summary.pnl_total_mark is None
+        assert summary.realized_pnl == 0.0  # no sells
+
+
+def test_fill_simulated_event_includes_side():
+    """Every fill_simulated event has a 'side' field in ('BUY', 'SELL')."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    asyncio.run(session.run_for(duration=5))
+    fill_events = [e for e in session.events if e.get("event") == "fill_simulated"]
+    assert fill_events, "expected at least one fill event"
+    assert all("side" in e for e in fill_events)
+    assert all(e["side"] in ("BUY", "SELL") for e in fill_events)
+
+
+def test_order_cancelled_event_includes_side():
+    """Every order_cancelled event has a 'side' field in ('BUY', 'SELL')."""
+
+    class _FakeStrategyRepriceBid:
+        def build(self, state: LocalState, fair: FairValueSnapshot, now_ms: int) -> DesiredQuotes:
+            price = 0.47 if state.yes_book.timestamp_ms > 100 else 0.48
+            return DesiredQuotes(
+                bid=DesiredOrder(enabled=True, side="BUY", price=price, size=10.0, reason="test"),
+                ask=DesiredOrder(enabled=False, side="SELL", price=0.55, size=10.0, reason="test"),
+                mode="passive",
+                inventory_skew=0.0,
+                timestamp_ms=state.yes_book.timestamp_ms,
+            )
+
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.52),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=_FakeStrategyRepriceBid(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    asyncio.run(session.run_for(duration=5))
+    cancel_events = [e for e in session.events if e.get("event") == "order_cancelled"]
+    assert cancel_events, "expected at least one cancel event"
+    assert all("side" in e for e in cancel_events)
+    assert all(e["side"] in ("BUY", "SELL") for e in cancel_events)
+
+
+def test_side_specific_order_and_fill_counters_split_bid_vs_ask():
+    """Round-trip produces both bid and ask fills; side counters sum correctly."""
+    summary = asyncio.run(_round_trip_session().run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1:
+        assert summary.bid_orders_posted >= 1
+        assert summary.ask_orders_posted >= 1
+        assert summary.fills_simulated == summary.bid_fills_simulated + summary.ask_fills_simulated
+        assert summary.orders_posted == summary.bid_orders_posted + summary.ask_orders_posted

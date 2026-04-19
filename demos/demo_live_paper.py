@@ -75,6 +75,10 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"  fills_simulated       : {summary.fills_simulated}")
     print(f"  filled_orders         : {summary.filled_orders}")
     print(f"  last_rejection        : {summary.last_rejection_reason}")
+    print(f"  bid_orders_posted     : {summary.bid_orders_posted}")
+    print(f"  ask_orders_posted     : {summary.ask_orders_posted}")
+    print(f"  bid_fills_simulated   : {summary.bid_fills_simulated}")
+    print(f"  ask_fills_simulated   : {summary.ask_fills_simulated}")
 
     print("\n  [derived metrics]")
     print(f"  fill_rate             : {summary.fill_rate}")
@@ -100,7 +104,8 @@ def _print_summary(summary: LivePaperSummary) -> None:
     pum = summary.pnl_unrealized_mark
     print(f"  pnl_total_mark          : {round(ptm, 4) if ptm is not None else None}")
     print(f"  pnl_unrealized_mark     : {round(pum, 4) if pum is not None else None}")
-    print(f"  cost_basis              : {round(summary.cost_basis, 4)}")
+    print(f"  realized_pnl            : {round(summary.realized_pnl, 4)}")
+    print(f"  position_cost_basis     : {round(summary.position_cost_basis, 4)}")
 
     print("\n  [attribution]")
     print(f"  decisions_triggered_by_market : {summary.decisions_triggered_by_market}")

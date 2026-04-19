@@ -81,6 +81,11 @@ class LivePaperSummary:
     fills_simulated: int
     filled_orders: int          # unique order_ids with ≥1 fill
     last_rejection_reason: Optional[str]
+    # Side-specific counters
+    bid_orders_posted: int
+    ask_orders_posted: int
+    bid_fills_simulated: int
+    ask_fills_simulated: int
     # Derived ratios (None when denominator == 0)
     fill_rate: Optional[float]              # filled_orders / orders_posted
     rejection_rate: Optional[float]         # orders_rejected / (orders_posted + orders_rejected)
@@ -101,9 +106,10 @@ class LivePaperSummary:
     # When up_free == 0 the portfolio value is exact (no mark uncertainty).
     portfolio_value_start: float            # initial_pusd — all cash at t0
     portfolio_value_end_mark: Optional[float]  # pusd_free + up_free * mark_price
-    pnl_total_mark: Optional[float]         # portfolio_value_end_mark - portfolio_value_start
-    pnl_unrealized_mark: Optional[float]    # up_free * mark_price - cost_basis
-    cost_basis: float                       # PUSD spent acquiring YES = initial_pusd - pusd_free
+    pnl_total_mark: Optional[float]         # realized_pnl + pnl_unrealized_mark
+    pnl_unrealized_mark: Optional[float]    # up_free * mark_price - position_cost_basis
+    realized_pnl: float                     # cumulative SELL realized PnL (average-cost method)
+    position_cost_basis: float              # remaining cost basis of open YES position
     mark_price: Optional[float]             # yes_book.top_bid().price at session end
     mark_source: str                        # always "yes_book_top_bid"
     # Attribution counters (per unique dedup-passing decision)
@@ -154,6 +160,7 @@ class LivePaperSession:
         strategy: Strategy,
         config: RuntimeConfig = DEFAULT_CONFIG,
         initial_pusd: Optional[float] = None,
+        initial_up: Optional[float] = None,
         market_router: Optional[MarketMessageRouter] = None,
         rtds_router: Optional[RTDSMessageRouter] = None,
         user_router: Optional[UserMessageRouter] = None,
@@ -169,6 +176,7 @@ class LivePaperSession:
         self._strategy = strategy
         self._config = config
         self._initial_pusd = initial_pusd
+        self._initial_up = initial_up
         self._market_router = market_router
         self._rtds_router = rtds_router
         self._user_router = user_router or UserMessageRouter()
@@ -201,6 +209,15 @@ class LivePaperSession:
         self._max_pusd_reserved: float = 0.0
         self._last_rejection_reason: Optional[str] = None
         self._portfolio_value_start: float = 0.0
+        # Side-specific counters
+        self._bid_orders_posted: int = 0
+        self._ask_orders_posted: int = 0
+        self._bid_fills_simulated: int = 0
+        self._ask_fills_simulated: int = 0
+        # Average-cost PnL tracking
+        self._position_qty: float = 0.0
+        self._position_cost_basis: float = 0.0
+        self._realized_pnl: float = 0.0
         # Attribution counters
         self._decisions_triggered_by_market: int = 0
         self._decisions_triggered_by_rtds: int = 0
@@ -239,6 +256,8 @@ class LivePaperSession:
             else self._config.default_working_capital_usd
         )
         state.inventory.pusd_free = pusd
+        if self._initial_up is not None:
+            state.inventory.up_free = self._initial_up
         self.state = state
         self._reset_run_state()
         self._portfolio_value_start = pusd
@@ -307,7 +326,8 @@ class LivePaperSession:
         final_up_free = state.inventory.up_free
 
         portfolio_value_start = float(pusd)
-        cost_basis = portfolio_value_start - final_pusd_free
+        position_cost_basis = self._position_cost_basis
+        realized_pnl = self._realized_pnl
 
         top_bid = state.yes_book.top_bid()
         mark_price = top_bid.price if top_bid is not None else None
@@ -316,18 +336,18 @@ class LivePaperSession:
         if final_up_free > 0.0:
             if mark_price is None:
                 portfolio_value_end_mark: Optional[float] = None
-                pnl_total_mark: Optional[float] = None
                 pnl_unrealized_mark: Optional[float] = None
+                pnl_total_mark: Optional[float] = None
             else:
                 inventory_mark_value = final_up_free * mark_price
                 portfolio_value_end_mark = final_pusd_free + inventory_mark_value
-                pnl_total_mark = portfolio_value_end_mark - portfolio_value_start
-                pnl_unrealized_mark = inventory_mark_value - cost_basis
+                pnl_unrealized_mark = inventory_mark_value - position_cost_basis
+                pnl_total_mark = realized_pnl + pnl_unrealized_mark
         else:
-            # No YES inventory to mark: portfolio value is still known even without a book.
+            # No open YES inventory — portfolio value exact, unrealized is zero.
             portfolio_value_end_mark = final_pusd_free
-            pnl_total_mark = portfolio_value_end_mark - portfolio_value_start
             pnl_unrealized_mark = 0.0
+            pnl_total_mark = realized_pnl
 
         avg_binance_age = _avg(self._binance_ages)
         max_binance_age = _max_int(self._binance_ages)
@@ -347,7 +367,8 @@ class LivePaperSession:
             "portfolio_value_end_mark": portfolio_value_end_mark,
             "pnl_total_mark": pnl_total_mark,
             "pnl_unrealized_mark": pnl_unrealized_mark,
-            "cost_basis": cost_basis,
+            "realized_pnl": realized_pnl,
+            "position_cost_basis": position_cost_basis,
             "mark_price": mark_price,
             "mark_source": mark_source,
             "up_free": final_up_free,
@@ -386,6 +407,10 @@ class LivePaperSession:
             fill_rate=fill_rate,
             rejection_rate=rejection_rate,
             cancel_to_post_ratio=cancel_to_post_ratio,
+            bid_orders_posted=self._bid_orders_posted,
+            ask_orders_posted=self._ask_orders_posted,
+            bid_fills_simulated=self._bid_fills_simulated,
+            ask_fills_simulated=self._ask_fills_simulated,
             max_up_inventory=self._max_up_inventory,
             max_pusd_reserved=self._max_pusd_reserved,
             first_fill_ts_ms=self._first_fill_ts_ms,
@@ -398,7 +423,8 @@ class LivePaperSession:
             portfolio_value_end_mark=portfolio_value_end_mark,
             pnl_total_mark=pnl_total_mark,
             pnl_unrealized_mark=pnl_unrealized_mark,
-            cost_basis=cost_basis,
+            realized_pnl=realized_pnl,
+            position_cost_basis=position_cost_basis,
             mark_price=mark_price,
             mark_source=mark_source,
             decisions_triggered_by_market=self._decisions_triggered_by_market,
@@ -635,11 +661,14 @@ class LivePaperSession:
         self, state: LocalState, desired: DesiredQuotes, now_ms: int
     ) -> None:
         """
-        Bid-only quote synchronisation, mirroring AsyncLocalRunner._sync_quotes().
+        Two-sided quote synchronisation (bid + ask), mirroring AsyncLocalRunner._sync_quotes().
+        Ask orders sell existing YES inventory only — no short selling.
         All order events flow through engine → QueueingUserRouter → drained here.
         """
         assert self._engine is not None
         threshold = self._config.thresholds.quote.size_change_reprice_ratio.value
+
+        # ---- BID side -------------------------------------------------------
         current_bid_id = state.live_bid_order_id
         current_bid = state.open_orders.get(current_bid_id) if current_bid_id else None
 
@@ -668,6 +697,7 @@ class LivePaperSession:
                     })
                 else:
                     self._orders_posted += 1
+                    self._bid_orders_posted += 1
                     self.events.append({
                         "ts_ms": now_ms,
                         "event": "order_posted",
@@ -696,6 +726,7 @@ class LivePaperSession:
                             "ts_ms": now_ms,
                             "event": "order_cancelled",
                             "order_id": current_bid_id,
+                            "side": "BUY",
                             "reason": "reprice",
                         })
                     order_id = self._engine.post_order(
@@ -721,6 +752,7 @@ class LivePaperSession:
                         })
                     else:
                         self._orders_posted += 1
+                        self._bid_orders_posted += 1
                         self.events.append({
                             "ts_ms": now_ms,
                             "event": "order_posted",
@@ -742,40 +774,185 @@ class LivePaperSession:
                         "ts_ms": now_ms,
                         "event": "order_cancelled",
                         "order_id": current_bid_id,
+                        "side": "BUY",
                         "reason": "bid_disabled",
+                    })
+
+        # ---- ASK side -------------------------------------------------------
+        current_ask_id = state.live_ask_order_id
+        current_ask = state.open_orders.get(current_ask_id) if current_ask_id else None
+
+        if desired.ask.enabled and desired.ask.price is not None and desired.ask.size > 0:
+            if current_ask is None:
+                order_id = self._engine.post_order(
+                    state,
+                    asset_id=state.market.yes_token_id,
+                    side=desired.ask.side,
+                    price=desired.ask.price,
+                    size=desired.ask.size,
+                    now_ms=now_ms,
+                    slot="ask",
+                )
+                if order_id is None:
+                    self._orders_rejected += 1
+                    reason = self._extract_rejection_reason(state)
+                    self._last_rejection_reason = reason
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_rejected",
+                        "side": desired.ask.side,
+                        "price": desired.ask.price,
+                        "size": desired.ask.size,
+                        "reason": reason,
+                    })
+                else:
+                    self._orders_posted += 1
+                    self._ask_orders_posted += 1
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_posted",
+                        "order_id": order_id,
+                        "side": desired.ask.side,
+                        "price": desired.ask.price,
+                        "size": desired.ask.size,
+                    })
+                self._drain_user_queue(state)
+            else:
+                remaining = current_ask.remaining
+                size_changed = (
+                    abs(remaining - desired.ask.size) / remaining >= threshold
+                    if remaining > 0
+                    else False
+                )
+                price_changed = abs(current_ask.price - desired.ask.price) > 1e-12
+                if price_changed or size_changed:
+                    cancel_action = self._engine.cancel_order(
+                        state, current_ask_id, now_ms, reason="reprice"
+                    )
+                    self._drain_user_queue(state)
+                    if cancel_action is not None:
+                        self._orders_cancelled += 1
+                        self.events.append({
+                            "ts_ms": now_ms,
+                            "event": "order_cancelled",
+                            "order_id": current_ask_id,
+                            "side": "SELL",
+                            "reason": "reprice",
+                        })
+                    order_id = self._engine.post_order(
+                        state,
+                        asset_id=state.market.yes_token_id,
+                        side=desired.ask.side,
+                        price=desired.ask.price,
+                        size=desired.ask.size,
+                        now_ms=now_ms + 1,
+                        slot="ask",
+                    )
+                    if order_id is None:
+                        self._orders_rejected += 1
+                        reason = self._extract_rejection_reason(state)
+                        self._last_rejection_reason = reason
+                        self.events.append({
+                            "ts_ms": now_ms,
+                            "event": "order_rejected",
+                            "side": desired.ask.side,
+                            "price": desired.ask.price,
+                            "size": desired.ask.size,
+                            "reason": reason,
+                        })
+                    else:
+                        self._orders_posted += 1
+                        self._ask_orders_posted += 1
+                        self.events.append({
+                            "ts_ms": now_ms,
+                            "event": "order_posted",
+                            "order_id": order_id,
+                            "side": desired.ask.side,
+                            "price": desired.ask.price,
+                            "size": desired.ask.size,
+                        })
+                    self._drain_user_queue(state)
+        else:
+            if current_ask is not None:
+                cancel_action = self._engine.cancel_order(
+                    state, current_ask_id, now_ms, reason="ask_disabled"
+                )
+                self._drain_user_queue(state)
+                if cancel_action is not None:
+                    self._orders_cancelled += 1
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_cancelled",
+                        "order_id": current_ask_id,
+                        "side": "SELL",
+                        "reason": "ask_disabled",
                     })
 
     def _check_fills(self, state: LocalState, now_ms: int) -> None:
         """
-        Conservative fill simulation: trigger fill when top_ask.price <= live_bid.price.
-        fill_size = min(order.remaining, top_ask.size).
+        Conservative fill simulation for both sides.
+        BUY fill: top_ask.price <= live_bid.price  (fill_size = min(remaining, top_ask.size))
+        SELL fill: top_bid.price >= live_ask.price  (fill_size = min(remaining, top_bid.size))
         """
         assert self._engine is not None
+
+        # BUY fill
         bid_id = state.live_bid_order_id
-        if not bid_id or bid_id not in state.open_orders:
-            return
-        order = state.open_orders[bid_id]
-        top_ask = state.yes_book.top_ask()
-        if top_ask is not None and top_ask.price <= order.price:
-            fill_size = min(order.remaining, top_ask.size)
-            fill_price = order.price
-            actions = self._engine.simulate_fill(
-                state, order_id=bid_id, fill_size=fill_size, now_ms=now_ms
-            )
-            self._drain_user_queue(state)
-            if actions:
-                self._fills_simulated += 1
-                self._filled_order_ids.add(bid_id)
-                if self._first_fill_ts_ms is None:
-                    self._first_fill_ts_ms = now_ms
-                self._last_fill_ts_ms = now_ms
-                self.events.append({
-                    "ts_ms": now_ms,
-                    "event": "fill_simulated",
-                    "order_id": bid_id,
-                    "fill_price": fill_price,
-                    "fill_size": fill_size,
-                })
+        if bid_id and bid_id in state.open_orders:
+            order = state.open_orders[bid_id]
+            top_ask = state.yes_book.top_ask()
+            if top_ask is not None and top_ask.price <= order.price:
+                fill_size = min(order.remaining, top_ask.size)
+                fill_price = order.price
+                actions = self._engine.simulate_fill(
+                    state, order_id=bid_id, fill_size=fill_size, now_ms=now_ms
+                )
+                self._drain_user_queue(state)
+                if actions:
+                    self._fills_simulated += 1
+                    self._bid_fills_simulated += 1
+                    self._filled_order_ids.add(bid_id)
+                    if self._first_fill_ts_ms is None:
+                        self._first_fill_ts_ms = now_ms
+                    self._last_fill_ts_ms = now_ms
+                    self._accrue_buy_fill(fill_size, fill_price)
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "fill_simulated",
+                        "order_id": bid_id,
+                        "side": "BUY",
+                        "fill_price": fill_price,
+                        "fill_size": fill_size,
+                    })
+
+        # SELL fill
+        ask_id = state.live_ask_order_id
+        if ask_id and ask_id in state.open_orders:
+            order = state.open_orders[ask_id]
+            top_bid = state.yes_book.top_bid()
+            if top_bid is not None and top_bid.price >= order.price:
+                fill_size = min(order.remaining, top_bid.size)
+                fill_price = order.price
+                actions = self._engine.simulate_fill(
+                    state, order_id=ask_id, fill_size=fill_size, now_ms=now_ms
+                )
+                self._drain_user_queue(state)
+                if actions:
+                    self._fills_simulated += 1
+                    self._ask_fills_simulated += 1
+                    self._filled_order_ids.add(ask_id)
+                    if self._first_fill_ts_ms is None:
+                        self._first_fill_ts_ms = now_ms
+                    self._last_fill_ts_ms = now_ms
+                    self._accrue_sell_fill(fill_size, fill_price)
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "fill_simulated",
+                        "order_id": ask_id,
+                        "side": "SELL",
+                        "fill_price": fill_price,
+                        "fill_size": fill_size,
+                    })
 
     def _drain_user_queue(self, state: LocalState) -> None:
         """Apply all pending user queue messages to state, then update peak inventory."""
@@ -799,6 +976,21 @@ class LivePaperSession:
             return str(state.logs[-1].payload.get("reason", "unknown"))
         return "unknown"
 
+    def _accrue_buy_fill(self, fill_size: float, fill_price: float) -> None:
+        self._position_qty += fill_size
+        self._position_cost_basis += fill_price * fill_size
+
+    def _accrue_sell_fill(self, fill_size: float, fill_price: float) -> None:
+        if self._position_qty < 1e-12:
+            return
+        avg_cost = self._position_cost_basis / self._position_qty
+        self._realized_pnl += (fill_price - avg_cost) * fill_size
+        self._position_qty -= fill_size
+        self._position_cost_basis -= avg_cost * fill_size
+        if self._position_qty < 1e-12:
+            self._position_qty = 0.0
+            self._position_cost_basis = 0.0
+
     def _reset_run_state(self) -> None:
         self.decisions = []
         self.events = []
@@ -820,6 +1012,13 @@ class LivePaperSession:
         self._max_pusd_reserved = 0.0
         self._last_rejection_reason = None
         self._portfolio_value_start = 0.0
+        self._bid_orders_posted = 0
+        self._ask_orders_posted = 0
+        self._bid_fills_simulated = 0
+        self._ask_fills_simulated = 0
+        self._position_qty = 0.0
+        self._position_cost_basis = 0.0
+        self._realized_pnl = 0.0
         self._decisions_triggered_by_market = 0
         self._decisions_triggered_by_rtds = 0
         self._decisions_ptb_locked = 0
