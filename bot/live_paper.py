@@ -32,7 +32,8 @@ BinanceSignalProvider + PolymarketChainlinkSignalProvider. Chainlink ticks from 
 Polymarket RTDS feed (wss://ws-live-data.polymarket.com, topic crypto_prices_chainlink,
 no auth) populate last_chainlink natively via RTDSMessageRouter. Not on-chain Chainlink.
 
-No real orders, no real fills, no PnL (no outcome available). Honest counters only.
+No real orders, no real fills. Mark-to-market PnL snapshot in LivePaperSummary
+(conservative: YES inventory valued at yes_book top bid). Not outcome PnL.
 
 Event log:
   session.events is a list[dict] populated during run_for(). Call
