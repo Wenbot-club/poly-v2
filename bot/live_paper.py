@@ -15,9 +15,9 @@ State mutations flow exclusively through MockExecutionEngine → QueueingUserRou
 
 Execution pattern:
   Each decision cycle (new dedup-passing decision):
-    → _sync_quotes_impl() posts/cancels simulated bid (bid-only, mirrors AsyncLocalRunner)
+    → _sync_quotes_impl() posts/cancels simulated bid and ask (mirrors AsyncLocalRunner)
   Each poll with state change (regardless of decision dedup):
-    → _check_fills() simulates fill when top_ask.price <= live_bid.price (conservative)
+    → _check_fills() simulates fill when crossing condition is met (conservative)
 
 Peak tracking:
   _update_peaks() is called inside _drain_user_queue() after every state mutation.
@@ -142,6 +142,13 @@ class LivePaperSession:
 
     initial_pusd: if None, seeds from config.default_working_capital_usd.
 
+    initial_up / initial_position_cost_basis: bootstrap an existing YES position.
+    When initial_up > 0, initial_position_cost_basis is required — it is the total
+    cost of the seeded inventory (e.g. 10 tokens at avg 0.50 → cost_basis=5.0).
+    Both fields feed into PnL accounting: portfolio_value_start = pusd + cost_basis,
+    and _accrue_sell_fill() uses the seeded cost basis for realized PnL calculation.
+    Omitting initial_position_cost_basis with initial_up > 0 raises ValueError.
+
     execution_engine_factory: receives the runtime QueueingUserRouter; if None,
     defaults to MockExecutionEngine(config, user_router=queueing_router).
 
@@ -161,6 +168,7 @@ class LivePaperSession:
         config: RuntimeConfig = DEFAULT_CONFIG,
         initial_pusd: Optional[float] = None,
         initial_up: Optional[float] = None,
+        initial_position_cost_basis: Optional[float] = None,
         market_router: Optional[MarketMessageRouter] = None,
         rtds_router: Optional[RTDSMessageRouter] = None,
         user_router: Optional[UserMessageRouter] = None,
@@ -170,6 +178,12 @@ class LivePaperSession:
         decision_poll_ms: int = 100,
         now_fn: Callable[[], int] = utc_now_ms,
     ) -> None:
+        if initial_up is not None and initial_up > 0 and initial_position_cost_basis is None:
+            raise ValueError(
+                "initial_position_cost_basis is required when initial_up > 0; "
+                "provide the total cost of the seeded YES position (e.g. 10 tokens at "
+                "avg 0.50 → initial_position_cost_basis=5.0) so realized PnL is correct."
+            )
         self._discovery = discovery
         self._market_provider = market_provider
         self._signal_provider = signal_provider
@@ -177,6 +191,7 @@ class LivePaperSession:
         self._config = config
         self._initial_pusd = initial_pusd
         self._initial_up = initial_up
+        self._initial_position_cost_basis = initial_position_cost_basis
         self._market_router = market_router
         self._rtds_router = rtds_router
         self._user_router = user_router or UserMessageRouter()
@@ -256,11 +271,18 @@ class LivePaperSession:
             else self._config.default_working_capital_usd
         )
         state.inventory.pusd_free = pusd
-        if self._initial_up is not None:
+        if self._initial_up is not None and self._initial_up > 0:
             state.inventory.up_free = self._initial_up
         self.state = state
         self._reset_run_state()
-        self._portfolio_value_start = pusd
+        # Seed position accounting from bootstrapped inventory (validation guarantees
+        # initial_position_cost_basis is not None when initial_up > 0).
+        if self._initial_up is not None and self._initial_up > 0:
+            self._position_qty = self._initial_up
+            self._position_cost_basis = self._initial_position_cost_basis  # type: ignore[assignment]
+            self._max_up_inventory = self._initial_up
+        cost_basis_at_start = self._initial_position_cost_basis or 0.0
+        self._portfolio_value_start = pusd + cost_basis_at_start
 
         user_queue: asyncio.Queue = asyncio.Queue()
         self._user_queue = user_queue
@@ -325,7 +347,7 @@ class LivePaperSession:
         final_pusd_reserved = state.inventory.pusd_reserved_for_bids
         final_up_free = state.inventory.up_free
 
-        portfolio_value_start = float(pusd)
+        portfolio_value_start = self._portfolio_value_start
         position_cost_basis = self._position_cost_basis
         realized_pnl = self._realized_pnl
 
@@ -457,9 +479,16 @@ class LivePaperSession:
             else self._config.default_working_capital_usd
         )
         state.inventory.pusd_free = pusd
+        if self._initial_up is not None and self._initial_up > 0:
+            state.inventory.up_free = self._initial_up
         self.state = state
         self._reset_run_state()
-        self._portfolio_value_start = pusd
+        if self._initial_up is not None and self._initial_up > 0:
+            self._position_qty = self._initial_up
+            self._position_cost_basis = self._initial_position_cost_basis  # type: ignore[assignment]
+            self._max_up_inventory = self._initial_up
+        cost_basis_at_start = self._initial_position_cost_basis or 0.0
+        self._portfolio_value_start = pusd + cost_basis_at_start
 
         user_queue: asyncio.Queue = asyncio.Queue()
         self._user_queue = user_queue

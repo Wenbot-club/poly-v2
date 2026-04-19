@@ -273,6 +273,7 @@ def _make_session(
     discovery: Optional[FakeDiscoveryProvider] = None,
     initial_pusd: Optional[float] = None,
     initial_up: Optional[float] = None,
+    initial_position_cost_basis: Optional[float] = None,
     decision_poll_ms: int = 100,
     ptb_locker: Optional[Any] = None,
     now_fn: Optional[Callable[[], int]] = None,
@@ -284,6 +285,8 @@ def _make_session(
         kwargs["now_fn"] = now_fn
     if initial_up is not None:
         kwargs["initial_up"] = initial_up
+    if initial_position_cost_basis is not None:
+        kwargs["initial_position_cost_basis"] = initial_position_cost_basis
     return LivePaperSession(
         discovery=discovery or FakeDiscoveryProvider(),
         market_provider=FakeMarketDataProvider(market_messages),
@@ -1125,7 +1128,9 @@ def test_ask_order_posted_when_inventory_positive_and_ask_enabled():
     """initial_up=20 → ask_enabled → ask_orders_posted >= 1."""
     msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
     strategy = FakeStrategy(_make_desired_quotes(bid_enabled=False, ask_enabled=True))
-    session = _make_session(msgs, [], strategy=strategy, initial_up=20.0)
+    session = _make_session(
+        msgs, [], strategy=strategy, initial_up=20.0, initial_position_cost_basis=10.0,
+    )
     summary = asyncio.run(session.run_for(duration=5))
     assert summary.ask_orders_posted >= 1
 
@@ -1158,6 +1163,7 @@ def test_ask_order_cancelled_when_ask_disabled():
         fair_engine=FakeFairValueEngine(),
         config=DEFAULT_CONFIG,
         initial_up=20.0,
+        initial_position_cost_basis=10.0,
         decision_poll_ms=0,
     )
     summary = asyncio.run(session.run_for(duration=5))
@@ -1192,6 +1198,7 @@ def test_ask_order_repriced_when_price_changes():
         fair_engine=FakeFairValueEngine(),
         config=DEFAULT_CONFIG,
         initial_up=20.0,
+        initial_position_cost_basis=10.0,
         decision_poll_ms=0,
     )
     summary = asyncio.run(session.run_for(duration=5))
@@ -1374,3 +1381,54 @@ def test_side_specific_order_and_fill_counters_split_bid_vs_ask():
         assert summary.ask_orders_posted >= 1
         assert summary.fills_simulated == summary.bid_fills_simulated + summary.ask_fills_simulated
         assert summary.orders_posted == summary.bid_orders_posted + summary.ask_orders_posted
+
+
+# ---------------------------------------------------------------------------
+# PR #13 fix — initial_up requires initial_position_cost_basis
+# ---------------------------------------------------------------------------
+
+def test_initial_up_requires_initial_position_cost_basis():
+    """ValueError when initial_up > 0 but initial_position_cost_basis is omitted."""
+    import pytest
+    with pytest.raises(ValueError, match="initial_position_cost_basis"):
+        LivePaperSession(
+            discovery=FakeDiscoveryProvider(),
+            market_provider=FakeMarketDataProvider([]),
+            signal_provider=FakeSignalProvider([]),
+            strategy=FakeStrategy(),
+            fair_engine=FakeFairValueEngine(),
+            config=DEFAULT_CONFIG,
+            initial_up=20.0,
+            # initial_position_cost_basis intentionally omitted
+        )
+
+
+def test_initial_position_cost_basis_seeds_realized_pnl_accounting_correctly():
+    """
+    Bootstrap: 10 YES tokens at avg cost 0.50 (cost_basis=5.0).
+    Sell all at 0.60 → realized_pnl = (0.60 - 0.50) * 10 = 1.0.
+    portfolio_value_start = pusd + cost_basis = 1000 + 5 = 1005.
+    """
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.55, ask_price=0.70),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.62, ask_price=0.75),  # top_bid=0.62 >= ask=0.60
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(_make_desired_quotes(bid_enabled=False, ask_enabled=True, ask_price=0.60)),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        initial_up=10.0,
+        initial_position_cost_basis=5.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.portfolio_value_start == 1005.0
+    if summary.ask_fills_simulated >= 1:
+        assert abs(summary.realized_pnl - 1.0) < 1e-9
+        assert summary.position_cost_basis == 0.0
+        assert summary.final_up_free == 0.0
+        assert summary.pnl_total_mark == summary.realized_pnl
