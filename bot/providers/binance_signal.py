@@ -46,6 +46,7 @@ class BinanceSignalProvider:
     connect() accepts "btc/usd" (internal canonical symbol).
     """
 
+    source_name: str = "binance"
     feed_state: Literal["connecting", "live", "stale", "disconnected"]
 
     def __init__(

@@ -183,7 +183,7 @@ class LiveRTDSSession:
 
         return LiveRTDSSummary(
             symbol=self._symbol,
-            source="binance",
+            source=getattr(self._signal_provider, "source_name", "binance"),
             total_ticks=total_ticks,
             first_value=first_value,
             last_value=last_value,

@@ -3,22 +3,29 @@ Combined read-only orchestrator with non-executing strategy layer.
 
 LiveDecisionSession wires together:
   LiveReadonlySession  — market book feed
-  LiveRTDSSession      — Binance signal feed
+  LiveRTDSSession      — signal feed (Binance, or composite Binance+Coinbase)
   FairValueEngine      — fair value computation (requires last_chainlink)
   PTBLocker            — price-to-beat lock
   Strategy             — produces DesiredQuotes
 
 Discovery is called exactly once. Both feeds share a single LocalState.
 The decision loop polls state every `decision_poll_ms` ms, fires when the
-market book or a Binance tick has advanced, and deduplicates identical decisions.
+market book or a signal tick has advanced, and deduplicates identical decisions.
 
 A final synchronous pass runs after both feeds complete, catching any state
 changes that occurred after the last polling interval.
 
-Chainlink is NOT wired in this session. FairValueEngine.compute() raises
-RuntimeError when last_chainlink is None. The session catches this, increments
-skipped_fair_value_count, records last_fair_value_error, and continues.
-In live operation without Chainlink: decision_count == 0, skipped counts tell why.
+Price anchor: FairValueEngine.compute() raises RuntimeError when last_chainlink
+is None. The session catches this, increments skipped_fair_value_count, records
+last_fair_value_error, and continues.
+
+To produce real decisions in live operation, pass a CompositeSignalProvider
+combining BinanceSignalProvider + CoinbaseAnchorProvider as the signal_provider.
+Coinbase ticks fill the internal anchor slot (last_chainlink). This is a Coinbase
+price anchor, NOT a Chainlink oracle — documented here, not hidden.
+
+With composite provider: decision_count > 0, skipped_fair_value_count == 0.
+Without anchor source: decision_count == 0, skipped counts explain why.
 
 No execution, no orders, no paper fills, no AsyncLocalRunner changes.
 """

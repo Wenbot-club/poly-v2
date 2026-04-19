@@ -76,6 +76,17 @@ def _binance_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[s
     }
 
 
+def _coinbase_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[str, Any]:
+    return {
+        "source": "coinbase",
+        "symbol": "btc/usd",
+        "timestamp_ms": ts,
+        "recv_timestamp_ms": ts + 50,
+        "value": value,
+        "sequence_no": seq,
+    }
+
+
 def _make_fair_snapshot(p_up: float = 0.52) -> FairValueSnapshot:
     return FairValueSnapshot(
         p_up=p_up,
@@ -479,3 +490,57 @@ def test_custom_factory_is_used_when_provided():
     )
     asyncio.run(session.run_for(duration=5))
     assert factory_calls[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Coinbase anchor unblocking — real FairValueEngine
+# ---------------------------------------------------------------------------
+
+def test_orders_posted_with_coinbase_anchor_unblocks_paper_execution():
+    """
+    Real FairValueEngine, Binance + Coinbase ticks, valid book, sufficient capital.
+    orders_posted >= 1 proves the full unblocking chain:
+      Coinbase anchor → last_chainlink → fair value computed → decision → order posted.
+    """
+    from bot.fair_value import FairValueEngine
+
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    ticks = [
+        _coinbase_tick(42000.5, seq=1),  # routes to last_chainlink (anchor)
+        _binance_tick(42000.0, seq=1),   # routes to last_binance
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProvider(msgs),
+        signal_provider=FakeSignalProvider(ticks),
+        strategy=FakeStrategy(),
+        fair_engine=FairValueEngine(config=DEFAULT_CONFIG),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted >= 1
+    assert summary.skipped_fair_value_count == 0
+    assert summary.decision_count >= 1
+
+
+def test_skipped_count_zero_with_coinbase_anchor_paper():
+    """Explicit: no skips when anchor is wired — last_fair_value_error must be None."""
+    from bot.fair_value import FairValueEngine
+
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    ticks = [_coinbase_tick(42000.0, seq=1), _binance_tick(42000.0, seq=1)]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProvider(msgs),
+        signal_provider=FakeSignalProvider(ticks),
+        strategy=FakeStrategy(),
+        fair_engine=FairValueEngine(config=DEFAULT_CONFIG),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.skipped_fair_value_count == 0
+    assert summary.last_fair_value_error is None

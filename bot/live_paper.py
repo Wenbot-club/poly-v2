@@ -3,7 +3,7 @@ Combined read-only orchestrator with conservative paper execution layer.
 
 LivePaperSession wires together:
   LiveReadonlySession  — market book feed
-  LiveRTDSSession      — Binance signal feed
+  LiveRTDSSession      — signal feed (Binance, or composite Binance+Coinbase)
   FairValueEngine      — fair value computation (requires last_chainlink)
   PTBLocker            — price-to-beat lock
   Strategy             — produces DesiredQuotes
@@ -19,8 +19,12 @@ Execution pattern:
   Each poll with state change (regardless of decision dedup):
     → _check_fills() simulates fill when top_ask.price <= live_bid.price (conservative)
 
-Chainlink absent: FairValueEngine.compute() raises RuntimeError. Caught as RuntimeError
-only — other exceptions propagate. Counted in skipped_fair_value_count.
+Price anchor: FairValueEngine.compute() raises RuntimeError when last_chainlink is None.
+Caught as RuntimeError only — other exceptions propagate. Counted in skipped_fair_value_count.
+
+To post simulated orders in live operation, pass a CompositeSignalProvider combining
+BinanceSignalProvider + CoinbaseAnchorProvider. Coinbase ticks fill the internal anchor
+slot (last_chainlink). This is a Coinbase price anchor, NOT a Chainlink oracle.
 
 No real orders, no real fills, no PnL (no outcome available). Honest counters only.
 """

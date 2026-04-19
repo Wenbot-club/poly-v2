@@ -36,23 +36,31 @@ class MarketDataProvider(Protocol):
 
 class SignalProvider(Protocol):
     """
-    Read-only live price/signal feed (e.g. Binance aggTrade).
+    Read-only live price/signal feed (e.g. Binance aggTrade, Coinbase anchor).
 
     iter_signals() yields normalized internal RTDS dicts ready for
     RTDSMessageRouter.apply() — not raw wire payloads.
 
     Implemented for this repo:
-      BinanceSignalProvider — btcusdt@aggTrade (no auth)
+      BinanceSignalProvider    — btcusdt@aggTrade WebSocket (no auth)
+      CoinbaseAnchorProvider   — BTC-USD REST polling (no auth); feeds the
+                                 internal price-anchor slot as a practical
+                                 Chainlink alternative (not a Chainlink oracle)
+      CompositeSignalProvider  — merges multiple providers into one stream
 
-    Not yet implemented (out of scope until auth/RPC confirmed):
+    Not yet implemented:
       Chainlink — Data Streams API requires credentials;
                   on-chain queries require a blockchain RPC node.
 
-    feed_state transitions mirror MarketDataProvider:
+    source_name: canonical string identifying the feed source(s).
+      e.g. "binance", "coinbase", "binance+coinbase"
+
+    feed_state transitions:
       connecting → live (on first valid signal)
       live → stale (no signal within stale_timeout_ms)
       any → disconnected (on close())
     """
+    source_name: str
     feed_state: Literal["connecting", "live", "stale", "disconnected"]
 
     async def connect(self, symbol: str) -> None: ...
