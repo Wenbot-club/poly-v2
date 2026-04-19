@@ -64,6 +64,9 @@ from .state import StateFactory
 from .strategy.base import Strategy
 
 
+_TAU_GATE_S: float = 30.0  # stop quoting this many seconds before market expiry
+
+
 @dataclass(slots=True)
 class LivePaperSummary:
     market: LiveReadonlySummary
@@ -247,6 +250,12 @@ class LivePaperSession:
         self._abs_gaps: list[float] = []
         self._fair_minus_bid_samples: list[float] = []
         self._ask_minus_fair_samples: list[float] = []
+        # Heartbeat / progress logging
+        self._run_started_ms: int = 0
+        self._last_heartbeat_ms: int = 0
+        # Rollover / window enforcement
+        self._trading_halted: bool = False
+        self._near_expiry_logged: bool = False
 
     # ---------------------------------------------------------------------- #
     # Public interface                                                         #
@@ -275,6 +284,19 @@ class LivePaperSession:
             state.inventory.up_free = self._initial_up
         self.state = state
         self._reset_run_state()
+        self._run_started_ms = self._now_fn()
+
+        # Clamp duration to remaining window so we never trade past expiry.
+        seconds_to_expiry = (market.end_ts_ms - self._run_started_ms) / 1000.0
+        effective_duration = int(min(duration, max(0, seconds_to_expiry)))
+        if effective_duration < duration:
+            print(
+                f"[session] duration clamped: requested={duration}s"
+                f"  window_remaining={seconds_to_expiry:.0f}s"
+                f"  → running for {effective_duration}s",
+                flush=True,
+            )
+
         # Seed position accounting from bootstrapped inventory (validation guarantees
         # initial_position_cost_basis is not None when initial_up > 0).
         if self._initial_up is not None and self._initial_up > 0:
@@ -311,8 +333,8 @@ class LivePaperSession:
 
         try:
             market_summary, rtds_summary = await asyncio.gather(
-                market_session.run_for(duration),
-                rtds_session.run_for(duration),
+                market_session.run_for(effective_duration),
+                rtds_session.run_for(effective_duration),
             )
         finally:
             decision_task.cancel()
@@ -540,7 +562,9 @@ class LivePaperSession:
 
     async def _decision_loop(self, state: LocalState) -> None:
         while True:
-            self._poll_and_execute(state, self._now_fn())
+            now_ms = self._now_fn()
+            self._poll_and_execute(state, now_ms)
+            self._maybe_heartbeat(state, now_ms)
             await asyncio.sleep(self._decision_poll_ms / 1000.0)
 
     def _poll_and_execute(self, state: LocalState, now_ms: int) -> None:
@@ -551,6 +575,30 @@ class LivePaperSession:
         Fill check runs on every state change regardless of decision dedup.
         RuntimeError from fair_engine is counted; all other exceptions propagate.
         """
+        # ---- Time-based guards (evaluated before data checks) ----
+        if self._trading_halted:
+            return
+
+        if now_ms >= state.market.end_ts_ms:
+            self._cancel_all_open_orders(state, now_ms, reason="market_expired")
+            self._trading_halted = True
+            print("[session] trading_halted: market window expired", flush=True)
+            return
+
+        tau_s = (state.market.end_ts_ms - now_ms) / 1000.0
+        if tau_s < _TAU_GATE_S:
+            if not self._near_expiry_logged:
+                self._near_expiry_logged = True
+                print(
+                    f"[session] near_expiry gate: tau_s={tau_s:.0f}s"
+                    f" — cancelling open orders, no new quotes",
+                    flush=True,
+                )
+            self._cancel_all_open_orders(state, now_ms, reason="near_expiry")
+            self._check_fills(state, now_ms)
+            return
+
+        # ---- Data check ----
         has_new_binance = (
             state.last_binance is not None
             and state.last_binance.sequence_no != self._last_binance_seq
@@ -678,6 +726,14 @@ class LivePaperSession:
                 "chainlink_age_ms": chainlink_age_ms,
                 "book_event_age_ms": book_event_age_ms,
             })
+            dc = self._decisions_triggered_by_market + self._decisions_triggered_by_rtds
+            bid_str = f"ON@{desired.bid.price}" if desired.bid.enabled else "off"
+            ask_str = f"ON@{desired.ask.price}" if desired.ask.enabled else "off"
+            print(
+                f"[decision #{dc}] {trigger} | fair={fair.p_up:.3f}"
+                f"  bid={bid_str}  ask={ask_str}",
+                flush=True,
+            )
             self._sync_quotes_impl(state, desired, now_ms)
 
         self._check_fills(state, now_ms)
@@ -724,6 +780,7 @@ class LivePaperSession:
                         "size": desired.bid.size,
                         "reason": reason,
                     })
+                    print(f"[order] BID REJECTED  reason={reason}", flush=True)
                 else:
                     self._orders_posted += 1
                     self._bid_orders_posted += 1
@@ -735,6 +792,7 @@ class LivePaperSession:
                         "price": desired.bid.price,
                         "size": desired.bid.size,
                     })
+                    print(f"[order] BID posted  price={desired.bid.price}  size={desired.bid.size}", flush=True)
                 self._drain_user_queue(state)
             else:
                 remaining = current_bid.remaining
@@ -953,6 +1011,11 @@ class LivePaperSession:
                         "fill_price": fill_price,
                         "fill_size": fill_size,
                     })
+                    print(
+                        f"[FILL] BUY  price={fill_price:.3f}  size={fill_size:.1f}"
+                        f"  pos={self._position_qty:.2f}  realized_pnl={self._realized_pnl:.4f}",
+                        flush=True,
+                    )
 
         # SELL fill
         ask_id = state.live_ask_order_id
@@ -982,6 +1045,11 @@ class LivePaperSession:
                         "fill_price": fill_price,
                         "fill_size": fill_size,
                     })
+                    print(
+                        f"[FILL] SELL  price={fill_price:.3f}  size={fill_size:.1f}"
+                        f"  pos={self._position_qty:.2f}  realized_pnl={self._realized_pnl:.4f}",
+                        flush=True,
+                    )
 
     def _drain_user_queue(self, state: LocalState) -> None:
         """Apply all pending user queue messages to state, then update peak inventory."""
@@ -1019,6 +1087,41 @@ class LivePaperSession:
         if self._position_qty < 1e-12:
             self._position_qty = 0.0
             self._position_cost_basis = 0.0
+
+    def _cancel_all_open_orders(
+        self, state: LocalState, now_ms: int, reason: str
+    ) -> None:
+        assert self._engine is not None
+        for order_id, side in [
+            (state.live_bid_order_id, "BUY"),
+            (state.live_ask_order_id, "SELL"),
+        ]:
+            if order_id and order_id in state.open_orders:
+                action = self._engine.cancel_order(state, order_id, now_ms, reason=reason)
+                self._drain_user_queue(state)
+                if action is not None:
+                    self._orders_cancelled += 1
+                    self.events.append({
+                        "ts_ms": now_ms,
+                        "event": "order_cancelled",
+                        "order_id": order_id,
+                        "side": side,
+                        "reason": reason,
+                    })
+
+    def _maybe_heartbeat(self, state: LocalState, now_ms: int) -> None:
+        if now_ms - self._last_heartbeat_ms < 60_000:
+            return
+        self._last_heartbeat_ms = now_ms
+        elapsed_s = (now_ms - self._run_started_ms) // 1000
+        dc = self._decisions_triggered_by_market + self._decisions_triggered_by_rtds
+        btc_b = f"{state.last_binance.value:.0f}" if state.last_binance else "—"
+        btc_c = f"{state.last_chainlink.value:.0f}" if state.last_chainlink else "—"
+        print(
+            f"[bot +{elapsed_s}s] BTC Binance={btc_b}  Chainlink={btc_c}"
+            f"  decisions={dc}  orders={self._orders_posted}  fills={self._fills_simulated}",
+            flush=True,
+        )
 
     def _reset_run_state(self) -> None:
         self.decisions = []
@@ -1059,6 +1162,10 @@ class LivePaperSession:
         self._abs_gaps = []
         self._fair_minus_bid_samples = []
         self._ask_minus_fair_samples = []
+        self._run_started_ms = 0
+        self._last_heartbeat_ms = 0
+        self._trading_halted = False
+        self._near_expiry_logged = False
 
     @staticmethod
     def _dedup_key_from(fair: FairValueSnapshot, dq: DesiredQuotes) -> tuple:

@@ -206,6 +206,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    if args.duration > 900:
+        print(
+            f"[paper] WARNING: --duration={args.duration}s dépasse une fenêtre M15 (900s).\n"
+            f"[paper]          La session sera clampée à la fenêtre courante.\n"
+            f"[paper]          Pour un run multi-fenêtres : python -m demos.demo_campaign",
+            flush=True,
+        )
+
     try:
         asyncio.run(run_demo(args.duration, journal_out=args.journal_out))
     except KeyboardInterrupt:
