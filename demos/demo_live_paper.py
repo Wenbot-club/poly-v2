@@ -4,20 +4,23 @@ Conservative paper execution demo via LivePaperSession.
 Connects to:
   - Polymarket CLOB WebSocket (market book feed)
   - Binance aggTrade WebSocket (BTC price signal)
+  - Polymarket RTDS Chainlink WebSocket (BTC/USD anchor, crypto_prices_chainlink)
+
+Signal feed: CompositeSignalProvider(Binance + PolymarketChainlink).
+
+Anchor source: Polymarket RTDS Chainlink (wss://ws-live-data.polymarket.com,
+topic crypto_prices_chainlink, filter {"symbol":"btc/usd"}). No auth required
+for crypto feeds. This is the Polymarket-relayed Chainlink BTC/USD feed — NOT
+on-chain Chainlink or Chainlink Data Streams (which require credentials).
+
+With the Chainlink anchor live, FairValueEngine.compute() succeeds, the decision
+layer produces real decisions, and MockExecutionEngine posts simulated orders.
+orders_posted > 0 when market conditions are met (bid below best ask, capital
+available). Contrast with previous behaviour: decision_count=0, orders_posted=0.
 
 Simulates order posting and fill via MockExecutionEngine — nothing is posted
 to any exchange. All state mutations flow through the existing execution
 infrastructure (MockExecutionEngine → QueueingUserRouter → UserMessageRouter).
-
-IMPORTANT — Chainlink is NOT wired. FairValueEngine requires last_chainlink.
-Without Chainlink:
-  decision_count         = 0
-  skipped_fair_value_count > 0
-  orders_posted          = 0
-
-This is expected. The demo proves feeds connect, the execution infrastructure
-is wired correctly, and the summary counters are honest about why execution
-didn't happen.
 
 No real orders, no real fills, no PnL reported.
 """
@@ -30,6 +33,8 @@ import aiohttp
 
 from bot.live_paper import LivePaperSession, LivePaperSummary
 from bot.providers.binance_signal import BinanceSignalProvider
+from bot.providers.composite_signal import CompositeSignalProvider
+from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_discovery import PolymarketDiscoveryProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_CONFIG
@@ -52,6 +57,7 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"  final_feed_state : {m.final_feed_state}")
 
     print("\n  [rtds feed]")
+    print(f"  source           : {r.source}")
     print(f"  total_ticks      : {r.total_ticks}")
     print(f"  min_value        : {r.min_value}")
     print(f"  max_value        : {r.max_value}")
@@ -73,10 +79,10 @@ def _print_summary(summary: LivePaperSummary) -> None:
     print(f"  pusd_free  : {round(summary.final_pusd_free, 4)}")
     print(f"  up_free    : {round(summary.final_up_free, 6)}")
 
-    if summary.decision_count == 0 and summary.skipped_fair_value_count > 0:
+    if summary.skipped_fair_value_count > 0 and summary.decision_count == 0:
         print(
-            f"\n  NOTE: {summary.skipped_fair_value_count} decision cycles skipped — "
-            "Chainlink not wired. orders_posted=0 is expected."
+            f"\n  NOTE: {summary.skipped_fair_value_count} decision cycles skipped —"
+            " Chainlink anchor not yet received. Transient at startup."
         )
 
     print(f"{'=' * 60}")
@@ -86,24 +92,29 @@ async def run_demo(duration: int) -> None:
     print(f"{'=' * 60}")
     print("  Conservative paper execution demo")
     print(f"  Market  : Polymarket CLOB WebSocket")
-    print(f"  Signal  : Binance aggTrade WebSocket")
+    print(f"  Signal  : Binance aggTrade + Polymarket RTDS Chainlink")
+    print(f"  Anchor  : Polymarket RTDS (crypto_prices_chainlink, no auth)")
+    print(f"  NOTE    : Polymarket-relayed Chainlink — NOT on-chain Chainlink")
     print(f"  Strategy: QuotePolicy (existing, bid-only)")
     print(f"  Engine  : MockExecutionEngine (no real orders)")
     print(f"  Capital : {DEFAULT_CONFIG.default_working_capital_usd} PUSD (from config)")
     print(f"  Duration: {duration}s")
-    print(f"  NOTE: Chainlink not wired — decision + execution layer will skip")
     print(f"{'=' * 60}")
 
     async with aiohttp.ClientSession() as http_session:
+        signal_provider = CompositeSignalProvider([
+            BinanceSignalProvider(http_session),
+            PolymarketChainlinkSignalProvider(http_session),
+        ])
         session = LivePaperSession(
             discovery=PolymarketDiscoveryProvider(http_session),
             market_provider=PolymarketMarketDataProvider(http_session),
-            signal_provider=BinanceSignalProvider(http_session),
+            signal_provider=signal_provider,
             strategy=QuotePolicy(config=DEFAULT_CONFIG),
             config=DEFAULT_CONFIG,
         )
 
-        print("\n[paper] discovering market and connecting both feeds…")
+        print("\n[paper] discovering market and connecting feeds…")
         try:
             summary = await session.run_for(duration=duration)
         except Exception as exc:
@@ -114,11 +125,14 @@ async def run_demo(duration: int) -> None:
 
         if session.state is not None:
             state = session.state
-            print(f"\n[state] open_orders     : {len(state.open_orders)}")
-            print(f"[state] binance_ticks   : {len(state.binance_ticks)}")
-            print(f"[state] tape_ewma       : {round(state.tape_ewma, 6)}")
+            print(f"\n[state] open_orders      : {len(state.open_orders)}")
+            print(f"[state] binance_ticks    : {len(state.binance_ticks)}")
+            print(f"[state] chainlink_ticks  : {len(state.chainlink_ticks)}")
+            print(f"[state] tape_ewma        : {round(state.tape_ewma, 6)}")
             if state.last_binance is not None:
-                print(f"[state] last BTC price  : {state.last_binance.value}")
+                print(f"[state] last BTC (Binance)   : {state.last_binance.value}")
+            if state.last_chainlink is not None:
+                print(f"[state] last BTC (Chainlink) : {state.last_chainlink.value}")
 
 
 def main(argv: list[str] | None = None) -> None:

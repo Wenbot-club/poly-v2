@@ -21,8 +21,9 @@ Feed-state transition tracking follows the same convention as LiveReadonlySessio
   the next tick arrives. Documented, not hidden.
 
 Chainlink:
-  RTDSMessageRouter accepts source="chainlink", but no Chainlink provider
-  exists in this codebase. See bot/providers/base.py SignalProvider docstring.
+  RTDSMessageRouter routes source="chainlink" → register_chainlink_tick().
+  PolymarketChainlinkSignalProvider (bot.providers.polymarket_chainlink_signal)
+  supplies the Polymarket RTDS Chainlink feed without auth.
 """
 from __future__ import annotations
 
@@ -183,7 +184,7 @@ class LiveRTDSSession:
 
         return LiveRTDSSummary(
             symbol=self._symbol,
-            source="binance",
+            source=getattr(self._signal_provider, "source_name", "binance"),
             total_ticks=total_ticks,
             first_value=first_value,
             last_value=last_value,

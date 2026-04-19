@@ -2,12 +2,12 @@
 Combined read-only orchestrator with conservative paper execution layer.
 
 LivePaperSession wires together:
-  LiveReadonlySession  — market book feed
-  LiveRTDSSession      — Binance signal feed
-  FairValueEngine      — fair value computation (requires last_chainlink)
-  PTBLocker            — price-to-beat lock
-  Strategy             — produces DesiredQuotes
-  MockExecutionEngine  — simulated order posting, cancellation, fill
+  LiveReadonlySession              — market book feed
+  LiveRTDSSession                  — signal feed (Binance + Chainlink composite)
+  FairValueEngine                  — fair value computation (requires last_chainlink)
+  PTBLocker                        — price-to-beat lock
+  Strategy                         — produces DesiredQuotes
+  MockExecutionEngine              — simulated order posting, cancellation, fill
 
 Discovery called exactly once. Both feeds share a single LocalState.
 State mutations flow exclusively through MockExecutionEngine → QueueingUserRouter
@@ -19,8 +19,13 @@ Execution pattern:
   Each poll with state change (regardless of decision dedup):
     → _check_fills() simulates fill when top_ask.price <= live_bid.price (conservative)
 
-Chainlink absent: FairValueEngine.compute() raises RuntimeError. Caught as RuntimeError
-only — other exceptions propagate. Counted in skipped_fair_value_count.
+Price anchor: FairValueEngine.compute() raises RuntimeError when last_chainlink is None.
+Caught as RuntimeError only — other exceptions propagate. Counted in skipped_fair_value_count.
+
+To post simulated orders in live operation, pass a CompositeSignalProvider combining
+BinanceSignalProvider + PolymarketChainlinkSignalProvider. Chainlink ticks from the
+Polymarket RTDS feed (wss://ws-live-data.polymarket.com, topic crypto_prices_chainlink,
+no auth) populate last_chainlink natively via RTDSMessageRouter. Not on-chain Chainlink.
 
 No real orders, no real fills, no PnL (no outcome available). Honest counters only.
 """

@@ -69,6 +69,17 @@ def _binance_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[s
     }
 
 
+def _chainlink_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[str, Any]:
+    return {
+        "source": "chainlink",
+        "symbol": "btc/usd",
+        "timestamp_ms": ts,
+        "recv_timestamp_ms": ts + 50,
+        "value": value,
+        "sequence_no": seq,
+    }
+
+
 def _make_fair_snapshot(p_up: float = 0.52) -> FairValueSnapshot:
     return FairValueSnapshot(
         p_up=p_up,
@@ -473,3 +484,48 @@ def test_provider_exhausted_before_timeout_returns_normally():
     assert isinstance(summary, LiveDecisionSummary)
     assert summary.market.book_count == 2
     assert summary.rtds.total_ticks == 3
+
+
+# ---------------------------------------------------------------------------
+# Coinbase anchor unblocking — real FairValueEngine
+# ---------------------------------------------------------------------------
+
+def test_real_fair_value_produces_decisions_with_chainlink_anchor():
+    """
+    Real FairValueEngine (no fake), Binance + Chainlink ticks, valid book.
+    Chainlink tick feeds last_chainlink via RTDSMessageRouter → fair value unblocked.
+    decision_count >= 1, skipped_fair_value_count == 0.
+    """
+    from bot.fair_value import FairValueEngine
+
+    msgs = [_book_msg("YES_TOKEN", ts=1_765_000_800_100)]
+    ticks = [
+        _chainlink_tick(42000.5, seq=1),  # routes to last_chainlink
+        _binance_tick(42000.0, seq=1),    # routes to last_binance
+    ]
+    session = _make_session(
+        market_messages=msgs,
+        rtds_ticks=ticks,
+        fair_engine=FairValueEngine(config=DEFAULT_CONFIG),
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.decision_count >= 1
+    assert summary.skipped_fair_value_count == 0
+
+
+def test_skipped_count_zero_with_chainlink_anchor():
+    """Explicit: no skips when anchor is wired — not just decision_count > 0."""
+    from bot.fair_value import FairValueEngine
+
+    msgs = [_book_msg("YES_TOKEN", ts=1_765_000_800_100)]
+    ticks = [_chainlink_tick(42000.0, seq=1), _binance_tick(42000.0, seq=1)]
+    session = _make_session(
+        market_messages=msgs,
+        rtds_ticks=ticks,
+        fair_engine=FairValueEngine(config=DEFAULT_CONFIG),
+        decision_poll_ms=0,
+    )
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.skipped_fair_value_count == 0
+    assert summary.last_fair_value_error is None

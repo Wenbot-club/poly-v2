@@ -2,23 +2,31 @@
 Combined read-only orchestrator with non-executing strategy layer.
 
 LiveDecisionSession wires together:
-  LiveReadonlySession  — market book feed
-  LiveRTDSSession      — Binance signal feed
-  FairValueEngine      — fair value computation (requires last_chainlink)
-  PTBLocker            — price-to-beat lock
-  Strategy             — produces DesiredQuotes
+  LiveReadonlySession              — market book feed
+  LiveRTDSSession                  — signal feed (Binance + Chainlink composite)
+  FairValueEngine                  — fair value computation (requires last_chainlink)
+  PTBLocker                        — price-to-beat lock
+  Strategy                         — produces DesiredQuotes
 
 Discovery is called exactly once. Both feeds share a single LocalState.
 The decision loop polls state every `decision_poll_ms` ms, fires when the
-market book or a Binance tick has advanced, and deduplicates identical decisions.
+market book or a signal tick has advanced, and deduplicates identical decisions.
 
 A final synchronous pass runs after both feeds complete, catching any state
 changes that occurred after the last polling interval.
 
-Chainlink is NOT wired in this session. FairValueEngine.compute() raises
-RuntimeError when last_chainlink is None. The session catches this, increments
-skipped_fair_value_count, records last_fair_value_error, and continues.
-In live operation without Chainlink: decision_count == 0, skipped counts tell why.
+Price anchor: FairValueEngine.compute() raises RuntimeError when last_chainlink
+is None. The session catches this, increments skipped_fair_value_count, records
+last_fair_value_error, and continues.
+
+To produce real decisions in live operation, pass a CompositeSignalProvider
+combining BinanceSignalProvider + PolymarketChainlinkSignalProvider. Chainlink
+ticks from the Polymarket RTDS feed (wss://ws-live-data.polymarket.com, topic
+crypto_prices_chainlink, no auth required) populate last_chainlink natively via
+RTDSMessageRouter → register_chainlink_tick(). Not on-chain Chainlink; no auth.
+
+With composite provider: decision_count > 0, skipped_fair_value_count == 0.
+Without anchor source: decision_count == 0, skipped counts explain why.
 
 No execution, no orders, no paper fills, no AsyncLocalRunner changes.
 """

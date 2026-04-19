@@ -4,22 +4,19 @@ Non-executing live decision demo via LiveDecisionSession.
 Connects to:
   - Polymarket CLOB WebSocket (market book feed)
   - Binance aggTrade WebSocket (BTC price signal)
+  - Polymarket RTDS Chainlink WebSocket (BTC/USD anchor, crypto_prices_chainlink)
 
-Runs for --duration seconds (default 10), then prints a combined summary
-including decision layer metrics.
+Signal feed: CompositeSignalProvider(Binance + PolymarketChainlink).
 
-IMPORTANT — Chainlink is NOT wired. FairValueEngine requires last_chainlink.
-Without Chainlink, the decision layer will skip every cycle and report:
-  decision_count         = 0
-  skipped_fair_value_count > 0
-  last_fair_value_error  = "chainlink tick required before fair value computation"
+Anchor source: Polymarket RTDS Chainlink (wss://ws-live-data.polymarket.com,
+topic crypto_prices_chainlink, filter {"symbol":"btc/usd"}). No auth required
+for crypto feeds. This is the Polymarket-relayed Chainlink BTC/USD feed — NOT
+on-chain Chainlink or Chainlink Data Streams (which require credentials).
 
-This is expected behaviour. The demo proves:
-  - both feeds connect and receive data
-  - the decision loop runs and detects missing prerequisites
-  - skipped_fair_value_count is an honest counter, not silence
+With the Chainlink anchor live, FairValueEngine.compute() succeeds and the
+decision layer produces real decisions (decision_count > 0, skipped_fair_value_count == 0).
 
-No strategy, no execution, no orders, no paper fills.
+No strategy execution, no orders, no paper fills.
 """
 from __future__ import annotations
 
@@ -30,6 +27,8 @@ import aiohttp
 
 from bot.live_decision import LiveDecisionSession, LiveDecisionSummary
 from bot.providers.binance_signal import BinanceSignalProvider
+from bot.providers.composite_signal import CompositeSignalProvider
+from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_discovery import PolymarketDiscoveryProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_CONFIG
@@ -53,6 +52,7 @@ def _print_summary(summary: LiveDecisionSummary) -> None:
     print(f"  final_feed_state : {m.final_feed_state}")
 
     print("\n  [rtds feed]")
+    print(f"  source           : {r.source}")
     print(f"  total_ticks      : {r.total_ticks}")
     print(f"  min_value        : {r.min_value}")
     print(f"  max_value        : {r.max_value}")
@@ -72,10 +72,10 @@ def _print_summary(summary: LiveDecisionSummary) -> None:
         print(f"  ask: enabled={dq.ask.enabled}  price={dq.ask.price}  size={dq.ask.size}")
         print(f"  mode: {dq.mode}")
 
-    if summary.decision_count == 0 and summary.skipped_fair_value_count > 0:
+    if summary.skipped_fair_value_count > 0 and summary.decision_count == 0:
         print(
             f"\n  NOTE: {summary.skipped_fair_value_count} decision cycles skipped —"
-            " Chainlink not wired (no auth). This is expected."
+            " Chainlink anchor not yet received. Transient at startup."
         )
 
     print(f"{'=' * 60}")
@@ -84,23 +84,28 @@ def _print_summary(summary: LiveDecisionSummary) -> None:
 async def run_demo(duration: int) -> None:
     print(f"{'=' * 60}")
     print("  Non-executing live decision demo")
-    print(f"  Market : Polymarket CLOB WebSocket")
-    print(f"  Signal : Binance aggTrade WebSocket")
+    print(f"  Market  : Polymarket CLOB WebSocket")
+    print(f"  Signal  : Binance aggTrade + Polymarket RTDS Chainlink")
+    print(f"  Anchor  : Polymarket RTDS (crypto_prices_chainlink, no auth)")
+    print(f"  NOTE    : Polymarket-relayed Chainlink — NOT on-chain Chainlink")
     print(f"  Strategy: QuotePolicy (read-only, no execution)")
     print(f"  Duration: {duration}s")
-    print(f"  NOTE: Chainlink not wired — fair value will be skipped")
     print(f"{'=' * 60}")
 
     async with aiohttp.ClientSession() as http_session:
+        signal_provider = CompositeSignalProvider([
+            BinanceSignalProvider(http_session),
+            PolymarketChainlinkSignalProvider(http_session),
+        ])
         session = LiveDecisionSession(
             discovery=PolymarketDiscoveryProvider(http_session),
             market_provider=PolymarketMarketDataProvider(http_session),
-            signal_provider=BinanceSignalProvider(http_session),
+            signal_provider=signal_provider,
             strategy=QuotePolicy(config=DEFAULT_CONFIG),
             config=DEFAULT_CONFIG,
         )
 
-        print("\n[decision] discovering market and connecting both feeds…")
+        print("\n[decision] discovering market and connecting feeds…")
         try:
             summary = await session.run_for(duration=duration)
         except Exception as exc:
@@ -111,10 +116,13 @@ async def run_demo(duration: int) -> None:
 
         if session.state is not None:
             state = session.state
-            print(f"\n[state] binance_ticks : {len(state.binance_ticks)}")
-            print(f"[state] tape_ewma     : {round(state.tape_ewma, 6)}")
+            print(f"\n[state] binance_ticks    : {len(state.binance_ticks)}")
+            print(f"[state] chainlink_ticks  : {len(state.chainlink_ticks)}")
+            print(f"[state] tape_ewma        : {round(state.tape_ewma, 6)}")
             if state.last_binance is not None:
-                print(f"[state] last BTC price: {state.last_binance.value}")
+                print(f"[state] last BTC (Binance)   : {state.last_binance.value}")
+            if state.last_chainlink is not None:
+                print(f"[state] last BTC (Chainlink) : {state.last_chainlink.value}")
 
 
 def main(argv: list[str] | None = None) -> None:
