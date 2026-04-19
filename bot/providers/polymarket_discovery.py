@@ -1,33 +1,45 @@
 """
-Read-only Polymarket market discovery via Gamma REST API.
+Read-only Polymarket BTC M15 market discovery via Gamma events API.
 
-Confirmed endpoint (April 2026, Polymarket Gamma docs):
-  GET https://gamma-api.polymarket.com/markets?active=true&closed=false
+Discovery approach (live-validated, April 2026):
+  M15 windows are 900-second UTC-aligned slots. The slug is deterministic:
+    btc-updown-15m-{window_ts}
+  where window_ts = floor(now_utc / 900) * 900.
 
-Confirmed response fields used here:
-  id, conditionId, title, slug, startDate, endDate,
-  active, closed, tokens[].tokenId, tokens[].outcome
+  Endpoint:
+    GET https://gamma-api.polymarket.com/events/slug/btc-updown-15m-{window_ts}
 
-Fields used defensively (present in observed responses, not in public spec):
-  minimumOrderSize, minimumTickSize
+  Response shape (relevant fields):
+    {
+      "markets": [{
+        "id": "...",
+        "conditionId": "...",
+        "question": "...",
+        "clobTokenIds": "[\"0xABC...\", \"0xDEF...\"]",   ← JSON-encoded string
+        "orderMinSize": 5,
+        "orderPriceMinTickSize": 0.01,
+        "takerBaseFee": 1000
+      }]
+    }
 
-Fields NOT fetched here — TODO until confirmed endpoint:
-  fee rates, taker delay, min_order_age_s
-  → ClobMarketInfo uses zero/false defaults for these; they are correct for
-    paper trading but must be filled before live execution is ever wired.
+  Token ordering (confirmed):
+    clobTokenIds[0] = UP token  (YES = "Will BTC go UP?")
+    clobTokenIds[1] = DOWN token (NO)
 
-BTC 15m selection heuristic:
-  This implementation has NO stable market-ID anchor. It matches by:
-    1. active=true, closed=false (server-side filter)
-    2. start_ts_ms <= now_ms < end_ts_ms (active time window)
-    3. title or slug contains a BTC keyword AND a 15-minute keyword (text heuristic)
-  If 0 or >1 markets pass all filters, an explicit error is raised.
-  The heuristic is intentionally conservative; broaden _15M_KEYWORDS or
-  _BTC_KEYWORDS only after live validation.
+  Timing hazard:
+    The market is sometimes not created for the first ~30 s of a new window.
+    find_active_btc_15m_market() retries up to LOOKUP_RETRIES times with
+    LOOKUP_RETRY_DELAY_S between attempts before raising NoMatchingMarketError.
+
+Fields NOT fetched here — TODO until confirmed:
+  maker fee, taker delay, min_order_age_s
+  → ClobMarketInfo uses zero/false defaults; correct for paper trading.
 """
 from __future__ import annotations
 
-import re
+import asyncio
+import json
+import math
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
@@ -44,12 +56,11 @@ from ..domain import (
 
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
-# Text-match sets — deliberately narrow to avoid false positives.
-# Expand only after verifying live market titles.
-_BTC_KEYWORDS: frozenset[str] = frozenset({"bitcoin", "btc"})
-_15M_KEYWORDS: frozenset[str] = frozenset({
-    "15m", "15-m", "15min", "15-min", "15 min", "15 minute", "15 minutes",
-})
+_BTC_15M_WINDOW_S: int = 900
+_BTC_15M_SLUG_PREFIX: str = "btc-updown-15m-"
+
+LOOKUP_RETRIES: int = 3
+LOOKUP_RETRY_DELAY_S: float = 2.0
 
 
 class GammaAPIError(Exception):
@@ -57,171 +68,129 @@ class GammaAPIError(Exception):
 
 
 class NoMatchingMarketError(Exception):
-    """Raised when no active BTC 15m market is found after all filters."""
+    """Raised when the BTC 15m market for the current window is not yet available."""
 
 
 class AmbiguousMarketError(Exception):
-    """Raised when more than one market passes the BTC 15m filter."""
+    """Kept for API compatibility; not raised by the slug-based lookup."""
 
 
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
 
-async def _fetch_active_markets(
+async def _fetch_event_by_slug(
     session: aiohttp.ClientSession,
+    slug: str,
     base_url: str,
-) -> List[Dict[str, Any]]:
+) -> Optional[Dict[str, Any]]:
     """
-    GET /markets?active=true&closed=false
-
-    Pagination: not implemented. The active+closed filter is narrow enough
-    that a single page should cover all live 15m BTC markets at any given
-    moment. Add pagination if this proves wrong in production.
+    GET /events/slug/{slug} → dict or None if 404.
+    Raises GammaAPIError on non-200/non-404 status.
     """
-    url = f"{base_url.rstrip('/')}/markets"
-    params = {"active": "true", "closed": "false"}
-    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+    url = f"{base_url.rstrip('/')}/events/slug/{slug}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        if resp.status == 404:
+            return None
         if resp.status != 200:
             text = await resp.text()
-            raise GammaAPIError(f"GET /markets returned HTTP {resp.status}: {text[:200]}")
-        data = await resp.json(content_type=None)
-    if not isinstance(data, list):
-        raise GammaAPIError(f"Expected list from GET /markets, got {type(data).__name__}")
-    return data
+            raise GammaAPIError(
+                f"GET /events/slug/{slug} returned HTTP {resp.status}: {text[:200]}"
+            )
+        return await resp.json(content_type=None)
 
 
 # ---------------------------------------------------------------------------
-# Selection heuristic
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _normalize_text(value: str) -> str:
-    return re.sub(r"[_\-/]", " ", value.lower())
-
-
-def _matches_btc_15m(raw: Dict[str, Any], now_ms: int) -> bool:
+def _decode_list_field(value: Any) -> List[str]:
     """
-    Three-gate filter (all must pass):
-      1. active=true, closed=false — already enforced server-side, re-checked here
-      2. start_ts_ms <= now_ms < end_ts_ms — market must be in its active window
-      3. BTC keyword AND 15m keyword present in title or slug
+    Gamma encodes some list fields as JSON strings (e.g. clobTokenIds).
+    Accept both a real list and a JSON-encoded string; return [] on failure.
     """
-    if not raw.get("active", False) or raw.get("closed", False):
-        return False
-
-    try:
-        start_ms = parse_iso_to_ms(str(raw["startDate"]))
-        end_ms = parse_iso_to_ms(str(raw["endDate"]))
-    except (KeyError, ValueError):
-        return False
-
-    if not (start_ms <= now_ms < end_ms):
-        return False
-
-    title_text = _normalize_text(str(raw.get("title", "")))
-    slug_text = _normalize_text(str(raw.get("slug", "")))
-    combined = f"{title_text} {slug_text}"
-
-    has_btc = any(kw in combined for kw in _BTC_KEYWORDS)
-    has_15m = any(kw in combined for kw in _15M_KEYWORDS)
-    return has_btc and has_15m
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                return [str(v) for v in decoded]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return []
 
 
 # ---------------------------------------------------------------------------
-# Parsing — pure functions, no I/O
+# Parsing
 # ---------------------------------------------------------------------------
 
-def _extract_tokens(raw: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+def _parse_btc_15m_event(
+    raw_event: Dict[str, Any],
+    slug: str,
+    window_ts: int,
+) -> MarketContext:
     """
-    Extract (yes_token_id, no_token_id) from Gamma market dict.
+    Parse a Gamma event dict into a MarketContext for a BTC M15 market.
 
-    Confirmed field: tokens[].tokenId, tokens[].outcome
-    Outcome values are "Yes"/"No" (case-insensitive match used for safety).
-    Returns (None, None) if the structure is missing or malformed.
+    Token ordering (live-validated):
+      clobTokenIds[0] → UP  → yes_token_id  (YES = BTC goes up)
+      clobTokenIds[1] → DOWN → no_token_id
+
+    Raises ValueError if the event structure is missing required fields.
     """
-    tokens = raw.get("tokens")
-    if not isinstance(tokens, list) or len(tokens) < 2:
-        return None, None
-    yes_id: Optional[str] = None
-    no_id: Optional[str] = None
-    for tok in tokens:
-        outcome = str(tok.get("outcome", "")).strip().lower()
-        token_id = tok.get("tokenId") or tok.get("token_id")  # accept both casings
-        if token_id is None:
-            return None, None
-        if outcome == "yes":
-            yes_id = str(token_id)
-        elif outcome == "no":
-            no_id = str(token_id)
-    return yes_id, no_id
+    markets = raw_event.get("markets")
+    if not isinstance(markets, list) or not markets:
+        raise ValueError(f"Event {slug!r}: missing or empty 'markets' in response")
 
+    raw_mkt = markets[0]
 
-def _parse_clob_info(raw: Dict[str, Any]) -> ClobMarketInfo:
-    """
-    Build ClobMarketInfo from Gamma market dict.
+    token_ids = _decode_list_field(raw_mkt.get("clobTokenIds"))
+    if len(token_ids) < 2:
+        raise ValueError(
+            f"Event {slug!r}: expected ≥2 clobTokenIds, got {token_ids!r}"
+        )
 
-    minimumOrderSize and minimumTickSize are present in observed Gamma
-    responses but are not in the published spec — used defensively with
-    fallbacks. All fee fields default to zero: confirmed correct for paper
-    trading; must be sourced from CLOB API before live execution.
-    """
-    min_order_size = float(raw.get("minimumOrderSize") or 5.0)
-    min_tick_size = float(raw.get("minimumTickSize") or 0.01)
+    yes_token_id = token_ids[0]   # UP
+    no_token_id = token_ids[1]    # DOWN
 
-    tokens = raw.get("tokens", [])
     clob_tokens = [
-        ClobToken(token_id=str(t.get("tokenId") or t.get("token_id", "")), outcome=str(t.get("outcome", "")))
-        for t in tokens
-        if (t.get("tokenId") or t.get("token_id"))
+        ClobToken(token_id=yes_token_id, outcome="Yes"),
+        ClobToken(token_id=no_token_id, outcome="No"),
     ]
 
-    return ClobMarketInfo(
+    min_order_size = float(raw_mkt.get("orderMinSize") or 5.0)
+    min_tick_size = float(raw_mkt.get("orderPriceMinTickSize") or 0.01)
+    taker_fee_bps = int(raw_mkt.get("takerBaseFee") or 0)
+
+    clob = ClobMarketInfo(
         tokens=clob_tokens,
         min_order_size=min_order_size,
         min_tick_size=min_tick_size,
-        # TODO: source from CLOB API (/markets/{condition_id} or similar) once endpoint confirmed
         maker_base_fee_bps=0,
-        taker_base_fee_bps=0,
+        taker_base_fee_bps=taker_fee_bps,
         taker_delay_enabled=False,
         min_order_age_s=0.0,
         fee_rate=0.0,
         fee_exponent=1.0,
     )
 
-
-def parse_gamma_market(raw: Dict[str, Any]) -> MarketContext:
-    """
-    Pure function: one Gamma market dict → MarketContext.
-    Raises ValueError with a descriptive message on any missing required field.
-    """
-    required = ("id", "conditionId", "title", "slug", "startDate", "endDate")
-    missing = [f for f in required if not raw.get(f)]
-    if missing:
-        raise ValueError(f"Gamma market missing required fields: {missing!r}  raw_id={raw.get('id')!r}")
-
-    yes_id, no_id = _extract_tokens(raw)
-    if yes_id is None or no_id is None:
-        raise ValueError(
-            f"Could not extract YES/NO token IDs from market {raw.get('id')!r}; "
-            f"tokens field: {raw.get('tokens')!r}"
-        )
-
-    try:
-        start_ms = parse_iso_to_ms(str(raw["startDate"]))
-        end_ms = parse_iso_to_ms(str(raw["endDate"]))
-    except ValueError as exc:
-        raise ValueError(f"Could not parse dates for market {raw.get('id')!r}: {exc}") from exc
+    question = str(
+        raw_mkt.get("question") or raw_event.get("title") or slug
+    )
+    market_id = str(raw_mkt.get("id") or slug)
+    condition_id = str(raw_mkt.get("conditionId") or raw_mkt.get("id") or slug)
 
     return MarketContext(
-        market_id=str(raw["id"]),
-        condition_id=str(raw["conditionId"]),
-        title=str(raw["title"]),
-        slug=str(raw["slug"]),
-        start_ts_ms=start_ms,
-        end_ts_ms=end_ms,
-        yes_token_id=yes_id,
-        no_token_id=no_id,
-        clob=_parse_clob_info(raw),
+        market_id=market_id,
+        condition_id=condition_id,
+        title=question,
+        slug=slug,
+        start_ts_ms=window_ts * 1000,
+        end_ts_ms=(window_ts + _BTC_15M_WINDOW_S) * 1000,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        clob=clob,
     )
 
 
@@ -231,13 +200,12 @@ def parse_gamma_market(raw: Dict[str, Any]) -> MarketContext:
 
 class PolymarketDiscoveryProvider:
     """
-    Async, read-only Polymarket market discovery via Gamma REST.
+    Async, read-only BTC M15 market discovery via Gamma events API.
+
+    Uses a deterministic slug (btc-updown-15m-{window_ts}) instead of
+    scanning all active markets — faster and unambiguous.
 
     Caller is responsible for creating and closing the aiohttp.ClientSession.
-    This provider does not own the session lifetime.
-
-    Not registered as DiscoveryProvider (sync Protocol) — the async interface
-    is intentionally distinct. See AsyncDiscoveryProvider in base.py.
     """
 
     def __init__(
@@ -252,33 +220,29 @@ class PolymarketDiscoveryProvider:
 
     async def find_active_btc_15m_market(self) -> MarketContext:
         """
-        Fetch active markets from Gamma and return the single BTC 15m market.
+        Look up the BTC M15 market for the current 900-second UTC window.
 
-        Selection criteria (see _matches_btc_15m for full detail):
-          - active=true, closed=false
-          - start_ts_ms <= now < end_ts_ms
-          - title/slug contains BTC keyword AND 15m keyword (text heuristic)
+        Retries up to LOOKUP_RETRIES times (with LOOKUP_RETRY_DELAY_S between
+        attempts) to tolerate the ~30 s publication delay at window start.
 
         Raises:
-          GammaAPIError         — HTTP error or unexpected response shape
-          NoMatchingMarketError — 0 candidates after all filters
-          AmbiguousMarketError  — >1 candidates (caller must refine criteria)
-          ValueError            — required fields missing in winning candidate
+          GammaAPIError         — HTTP error from Gamma API
+          NoMatchingMarketError — market not yet published after all retries
+          ValueError            — event found but response is malformed
         """
-        now_ms = self._now_fn()
-        raw_markets = await _fetch_active_markets(self._session, self._base_url)
-        candidates = [m for m in raw_markets if _matches_btc_15m(m, now_ms)]
+        now_s = self._now_fn() / 1000.0
+        window_ts = int(math.floor(now_s / _BTC_15M_WINDOW_S) * _BTC_15M_WINDOW_S)
+        slug = f"{_BTC_15M_SLUG_PREFIX}{window_ts}"
 
-        if len(candidates) == 0:
-            raise NoMatchingMarketError(
-                f"No active BTC 15m market found at now_ms={now_ms}. "
-                f"Total markets returned by Gamma: {len(raw_markets)}."
-            )
-        if len(candidates) > 1:
-            titles = [m.get("title", m.get("id", "?")) for m in candidates]
-            raise AmbiguousMarketError(
-                f"{len(candidates)} markets matched BTC 15m filter at now_ms={now_ms}: {titles!r}. "
-                "Tighten _BTC_KEYWORDS/_15M_KEYWORDS or add a slug prefix after live validation."
-            )
+        for attempt in range(LOOKUP_RETRIES):
+            raw_event = await _fetch_event_by_slug(self._session, slug, self._base_url)
+            if raw_event is not None:
+                return _parse_btc_15m_event(raw_event, slug, window_ts)
+            if attempt < LOOKUP_RETRIES - 1:
+                await asyncio.sleep(LOOKUP_RETRY_DELAY_S)
 
-        return parse_gamma_market(candidates[0])
+        raise NoMatchingMarketError(
+            f"BTC 15m market not found for window_ts={window_ts} (slug={slug!r}) "
+            f"after {LOOKUP_RETRIES} attempts ({LOOKUP_RETRY_DELAY_S}s between each). "
+            "The market may not be created yet — wait a few seconds and retry."
+        )
