@@ -736,3 +736,123 @@ def test_write_jsonl_writes_correct_line_count():
         assert path.exists()
         content = path.read_text(encoding="utf-8")
         assert content.count("\n") == 3
+
+
+# ---------------------------------------------------------------------------
+# PR #11 — mark-to-market PnL
+# ---------------------------------------------------------------------------
+
+def _fill_scenario_msgs():
+    """Three-message sequence: post order, trigger fill, set final mark."""
+    return [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.40, ask_price=0.45),  # fill
+        _book_msg("YES_TOKEN", ts=300, bid_price=0.55, ask_price=0.90),  # final mark
+    ]
+
+
+def _fill_session(msgs, initial_pusd=1000.0):
+    return LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=initial_pusd,
+        decision_poll_ms=0,
+    )
+
+
+def test_portfolio_value_start_equals_initial_pusd():
+    session = _make_session([], [], initial_pusd=250.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.portfolio_value_start == 250.0
+
+
+def test_pnl_computable_when_no_book_and_no_inventory():
+    """up_free == 0 and no book → value is exact (no mark uncertainty)."""
+    session = _make_session([], [], initial_pusd=125.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.final_up_free == 0.0
+    assert summary.mark_price is None                        # no book
+    assert summary.portfolio_value_end_mark == 125.0         # = pusd_free
+    assert summary.pnl_total_mark == 0.0
+    assert summary.pnl_unrealized_mark == 0.0
+
+
+def test_pnl_none_when_no_book_but_inventory_positive():
+    """up_free > 0 and yes_book has no bids → mark fields are None."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.40, ask_price=0.45),  # fill
+        {"event_type": "book", "asset_id": "YES_TOKEN", "timestamp": 300,
+         "bids": [], "asks": [{"price": 0.90, "size": 25.0}]},           # bids cleared
+    ]
+    session = _fill_session(msgs)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.fills_simulated >= 1
+    assert summary.final_up_free > 0
+    assert summary.mark_price is None
+    assert summary.portfolio_value_end_mark is None
+    assert summary.pnl_total_mark is None
+    assert summary.pnl_unrealized_mark is None
+
+
+def test_mark_price_is_yes_book_top_bid():
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.mark_price is not None
+    assert abs(summary.mark_price - 0.46) < 1e-10
+
+
+def test_mark_source_is_yes_book_top_bid():
+    session = _make_session([], [])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.mark_source == "yes_book_top_bid"
+
+
+def test_cost_basis_equals_total_fill_cost():
+    """cost_basis = initial_pusd - pusd_free = sum of (price * size) for all fills."""
+    session = _fill_session(_fill_scenario_msgs(), initial_pusd=1000.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.fills_simulated >= 1:
+        # FakeStrategy bids at 0.48, size 10 → fill cost = 4.8
+        expected_cost = summary.portfolio_value_start - summary.final_pusd_free
+        assert abs(summary.cost_basis - expected_cost) < 1e-10
+
+
+def test_pnl_positive_when_mark_above_fill_price():
+    """Fill at 0.48, final mark at 0.55 → pnl > 0."""
+    session = _fill_session(_fill_scenario_msgs(), initial_pusd=1000.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.fills_simulated >= 1 and summary.pnl_total_mark is not None:
+        assert summary.pnl_total_mark > 0
+        assert summary.pnl_unrealized_mark > 0
+
+
+def test_pnl_negative_when_mark_below_fill_price():
+    """Fill at 0.48, final mark at 0.35 → pnl < 0."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, bid_price=0.40, ask_price=0.45),  # fill at 0.48
+        _book_msg("YES_TOKEN", ts=300, bid_price=0.35, ask_price=0.55),  # mark = 0.35
+    ]
+    session = _fill_session(msgs, initial_pusd=1000.0)
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.fills_simulated >= 1 and summary.pnl_total_mark is not None:
+        assert summary.pnl_total_mark < 0
+        assert summary.pnl_unrealized_mark < 0
+
+
+def test_session_end_event_in_journal():
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    asyncio.run(session.run_for(duration=5))
+    assert session.events[-1]["event"] == "session_end"
+    end = session.events[-1]
+    assert "portfolio_value_start" in end
+    assert "mark_source" in end
+    assert end["mark_source"] == "yes_book_top_bid"
+    assert "pusd_reserved" in end

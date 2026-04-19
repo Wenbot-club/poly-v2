@@ -32,7 +32,8 @@ BinanceSignalProvider + PolymarketChainlinkSignalProvider. Chainlink ticks from 
 Polymarket RTDS feed (wss://ws-live-data.polymarket.com, topic crypto_prices_chainlink,
 no auth) populate last_chainlink natively via RTDSMessageRouter. Not on-chain Chainlink.
 
-No real orders, no real fills, no PnL (no outcome available). Honest counters only.
+No real orders, no real fills. Mark-to-market PnL snapshot in LivePaperSummary
+(conservative: YES inventory valued at yes_book top bid). Not outcome PnL.
 
 Event log:
   session.events is a list[dict] populated during run_for(). Call
@@ -93,6 +94,18 @@ class LivePaperSummary:
     # Final inventory
     final_pusd_free: float
     final_up_free: float
+    final_pusd_reserved: float
+    # Mark-to-market PnL (conservative: YES inventory valued at yes_book top bid)
+    # pnl_total_mark == pnl_unrealized_mark in bid-only mode (no sells → no realization).
+    # All mark fields are None when up_free > 0 and yes_book has no bids.
+    # When up_free == 0 the portfolio value is exact (no mark uncertainty).
+    portfolio_value_start: float            # initial_pusd — all cash at t0
+    portfolio_value_end_mark: Optional[float]  # pusd_free + up_free * mark_price
+    pnl_total_mark: Optional[float]         # portfolio_value_end_mark - portfolio_value_start
+    pnl_unrealized_mark: Optional[float]    # up_free * mark_price - cost_basis
+    cost_basis: float                       # PUSD spent acquiring YES = initial_pusd - pusd_free
+    mark_price: Optional[float]             # yes_book.top_bid().price at session end
+    mark_source: str                        # always "yes_book_top_bid"
 
 
 class LivePaperSession:
@@ -167,6 +180,7 @@ class LivePaperSession:
         self._max_up_inventory: float = 0.0
         self._max_pusd_reserved: float = 0.0
         self._last_rejection_reason: Optional[str] = None
+        self._portfolio_value_start: float = 0.0
 
     # ---------------------------------------------------------------------- #
     # Public interface                                                         #
@@ -193,6 +207,7 @@ class LivePaperSession:
         state.inventory.pusd_free = pusd
         self.state = state
         self._reset_run_state()
+        self._portfolio_value_start = pusd
 
         user_queue: asyncio.Queue = asyncio.Queue()
         self._user_queue = user_queue
@@ -244,6 +259,48 @@ class LivePaperSession:
         first_ts = self.decisions[0].now_ms if self.decisions else None
         last_ts = self.decisions[-1].now_ms if self.decisions else None
 
+        final_pusd_free = state.inventory.pusd_free
+        final_pusd_reserved = state.inventory.pusd_reserved_for_bids
+        final_up_free = state.inventory.up_free
+
+        portfolio_value_start = float(pusd)
+        cost_basis = portfolio_value_start - final_pusd_free
+
+        top_bid = state.yes_book.top_bid()
+        mark_price = top_bid.price if top_bid is not None else None
+        mark_source = "yes_book_top_bid"
+
+        if final_up_free > 0.0:
+            if mark_price is None:
+                portfolio_value_end_mark: Optional[float] = None
+                pnl_total_mark: Optional[float] = None
+                pnl_unrealized_mark: Optional[float] = None
+            else:
+                inventory_mark_value = final_up_free * mark_price
+                portfolio_value_end_mark = final_pusd_free + inventory_mark_value
+                pnl_total_mark = portfolio_value_end_mark - portfolio_value_start
+                pnl_unrealized_mark = inventory_mark_value - cost_basis
+        else:
+            # No YES inventory to mark: portfolio value is still known even without a book.
+            portfolio_value_end_mark = final_pusd_free
+            pnl_total_mark = portfolio_value_end_mark - portfolio_value_start
+            pnl_unrealized_mark = 0.0
+
+        self.events.append({
+            "ts_ms": utc_now_ms(),
+            "event": "session_end",
+            "portfolio_value_start": portfolio_value_start,
+            "portfolio_value_end_mark": portfolio_value_end_mark,
+            "pnl_total_mark": pnl_total_mark,
+            "pnl_unrealized_mark": pnl_unrealized_mark,
+            "cost_basis": cost_basis,
+            "mark_price": mark_price,
+            "mark_source": mark_source,
+            "up_free": final_up_free,
+            "pusd_free": final_pusd_free,
+            "pusd_reserved": final_pusd_reserved,
+        })
+
         return LivePaperSummary(
             market=market_summary,
             rtds=rtds_summary,
@@ -264,9 +321,17 @@ class LivePaperSession:
             max_pusd_reserved=self._max_pusd_reserved,
             first_fill_ts_ms=self._first_fill_ts_ms,
             last_fill_ts_ms=self._last_fill_ts_ms,
-            final_pusd_free=state.inventory.pusd_free,
-            final_up_free=state.inventory.up_free,
+            final_pusd_free=final_pusd_free,
+            final_up_free=final_up_free,
+            final_pusd_reserved=final_pusd_reserved,
             last_rejection_reason=self._last_rejection_reason,
+            portfolio_value_start=portfolio_value_start,
+            portfolio_value_end_mark=portfolio_value_end_mark,
+            pnl_total_mark=pnl_total_mark,
+            pnl_unrealized_mark=pnl_unrealized_mark,
+            cost_basis=cost_basis,
+            mark_price=mark_price,
+            mark_source=mark_source,
         )
 
     async def run_forever(self) -> None:
@@ -284,6 +349,7 @@ class LivePaperSession:
         state.inventory.pusd_free = pusd
         self.state = state
         self._reset_run_state()
+        self._portfolio_value_start = pusd
 
         user_queue: asyncio.Queue = asyncio.Queue()
         self._user_queue = user_queue
@@ -594,6 +660,7 @@ class LivePaperSession:
         self._max_up_inventory = 0.0
         self._max_pusd_reserved = 0.0
         self._last_rejection_reason = None
+        self._portfolio_value_start = 0.0
 
     @staticmethod
     def _dedup_key_from(fair: FairValueSnapshot, dq: DesiredQuotes) -> tuple:
