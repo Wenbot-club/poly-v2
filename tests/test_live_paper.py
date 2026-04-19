@@ -76,9 +76,9 @@ def _binance_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[s
     }
 
 
-def _coinbase_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[str, Any]:
+def _chainlink_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[str, Any]:
     return {
-        "source": "coinbase",
+        "source": "chainlink",
         "symbol": "btc/usd",
         "timestamp_ms": ts,
         "recv_timestamp_ms": ts + 50,
@@ -496,18 +496,18 @@ def test_custom_factory_is_used_when_provided():
 # Coinbase anchor unblocking — real FairValueEngine
 # ---------------------------------------------------------------------------
 
-def test_orders_posted_with_coinbase_anchor_unblocks_paper_execution():
+def test_orders_posted_with_chainlink_anchor_unblocks_paper_execution():
     """
-    Real FairValueEngine, Binance + Coinbase ticks, valid book, sufficient capital.
+    Real FairValueEngine, Binance + Chainlink ticks, valid book, sufficient capital.
     orders_posted >= 1 proves the full unblocking chain:
-      Coinbase anchor → last_chainlink → fair value computed → decision → order posted.
+      Chainlink anchor → last_chainlink → fair value computed → decision → order posted.
     """
     from bot.fair_value import FairValueEngine
 
     msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
     ticks = [
-        _coinbase_tick(42000.5, seq=1),  # routes to last_chainlink (anchor)
-        _binance_tick(42000.0, seq=1),   # routes to last_binance
+        _chainlink_tick(42000.5, seq=1),  # routes to last_chainlink
+        _binance_tick(42000.0, seq=1),    # routes to last_binance
     ]
     session = LivePaperSession(
         discovery=FakeDiscoveryProvider(),
@@ -525,12 +525,12 @@ def test_orders_posted_with_coinbase_anchor_unblocks_paper_execution():
     assert summary.decision_count >= 1
 
 
-def test_skipped_count_zero_with_coinbase_anchor_paper():
+def test_skipped_count_zero_with_chainlink_anchor_paper():
     """Explicit: no skips when anchor is wired — last_fair_value_error must be None."""
     from bot.fair_value import FairValueEngine
 
     msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
-    ticks = [_coinbase_tick(42000.0, seq=1), _binance_tick(42000.0, seq=1)]
+    ticks = [_chainlink_tick(42000.0, seq=1), _binance_tick(42000.0, seq=1)]
     session = LivePaperSession(
         discovery=FakeDiscoveryProvider(),
         market_provider=FakeMarketDataProvider(msgs),

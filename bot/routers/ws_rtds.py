@@ -25,10 +25,7 @@ class RTDSMessageRouter:
     def apply(self, state: LocalState, message: Dict[str, Any]) -> None:
         parsed = self._parse_message(message)
         state.set_clock(parsed.recv_timestamp_ms)
-        if parsed.source in ("chainlink", "coinbase"):
-            # "coinbase" feeds the same generic price-anchor slot as "chainlink".
-            # The slot is still named last_chainlink internally for compatibility;
-            # this is a temporary anchor, not a Chainlink oracle.
+        if parsed.source == "chainlink":
             register_chainlink_tick(state, self._to_tick(parsed))
         elif parsed.source == "binance":
             register_binance_tick(state, self._to_tick(parsed), self.config)
@@ -42,7 +39,7 @@ class RTDSMessageRouter:
             raise ValueError(f"missing RTDS fields: {missing}")
 
         source = str(message["source"]).lower()
-        if source not in {"chainlink", "binance", "coinbase"}:
+        if source not in {"chainlink", "binance"}:
             raise ValueError(f"unsupported RTDS source: {source!r}")
 
         symbol = str(message["symbol"])

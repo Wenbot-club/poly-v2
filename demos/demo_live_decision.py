@@ -4,18 +4,19 @@ Non-executing live decision demo via LiveDecisionSession.
 Connects to:
   - Polymarket CLOB WebSocket (market book feed)
   - Binance aggTrade WebSocket (BTC price signal)
-  - Coinbase Exchange REST ticker (BTC-USD price anchor, polled every 1 s)
+  - Polymarket RTDS Chainlink WebSocket (BTC/USD anchor, crypto_prices_chainlink)
 
-Signal feed: CompositeSignalProvider(Binance + Coinbase).
-Coinbase ticks fill the internal price-anchor slot (last_chainlink) via
-RTDSMessageRouter, unblocking FairValueEngine. This is a Coinbase anchor,
-NOT a Chainlink oracle — a practical no-auth deblocker, not the final source.
+Signal feed: CompositeSignalProvider(Binance + PolymarketChainlink).
 
-With both feeds live and the Coinbase anchor providing a price, the decision
-layer now produces real decisions (decision_count > 0). Contrast with the
-previous behaviour where every cycle was skipped (skipped_fair_value_count > 0).
+Anchor source: Polymarket RTDS Chainlink (wss://ws-live-data.polymarket.com,
+topic crypto_prices_chainlink, filter {"symbol":"btc/usd"}). No auth required
+for crypto feeds. This is the Polymarket-relayed Chainlink BTC/USD feed — NOT
+on-chain Chainlink or Chainlink Data Streams (which require credentials).
 
-No strategy, no execution, no orders, no paper fills.
+With the Chainlink anchor live, FairValueEngine.compute() succeeds and the
+decision layer produces real decisions (decision_count > 0, skipped_fair_value_count == 0).
+
+No strategy execution, no orders, no paper fills.
 """
 from __future__ import annotations
 
@@ -26,8 +27,8 @@ import aiohttp
 
 from bot.live_decision import LiveDecisionSession, LiveDecisionSummary
 from bot.providers.binance_signal import BinanceSignalProvider
-from bot.providers.coinbase_anchor import CoinbaseAnchorProvider
 from bot.providers.composite_signal import CompositeSignalProvider
+from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_discovery import PolymarketDiscoveryProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_CONFIG
@@ -71,10 +72,10 @@ def _print_summary(summary: LiveDecisionSummary) -> None:
         print(f"  ask: enabled={dq.ask.enabled}  price={dq.ask.price}  size={dq.ask.size}")
         print(f"  mode: {dq.mode}")
 
-    if summary.skipped_fair_value_count > 0:
+    if summary.skipped_fair_value_count > 0 and summary.decision_count == 0:
         print(
             f"\n  NOTE: {summary.skipped_fair_value_count} decision cycles skipped —"
-            " anchor price not yet received. This is transient at startup."
+            " Chainlink anchor not yet received. Transient at startup."
         )
 
     print(f"{'=' * 60}")
@@ -84,9 +85,9 @@ async def run_demo(duration: int) -> None:
     print(f"{'=' * 60}")
     print("  Non-executing live decision demo")
     print(f"  Market  : Polymarket CLOB WebSocket")
-    print(f"  Signal  : Binance aggTrade WebSocket + Coinbase REST anchor")
-    print(f"  Anchor  : Coinbase Exchange (BTC-USD, polled every 1 s)")
-    print(f"  NOTE    : Coinbase is the price anchor — NOT Chainlink")
+    print(f"  Signal  : Binance aggTrade + Polymarket RTDS Chainlink")
+    print(f"  Anchor  : Polymarket RTDS (crypto_prices_chainlink, no auth)")
+    print(f"  NOTE    : Polymarket-relayed Chainlink — NOT on-chain Chainlink")
     print(f"  Strategy: QuotePolicy (read-only, no execution)")
     print(f"  Duration: {duration}s")
     print(f"{'=' * 60}")
@@ -94,7 +95,7 @@ async def run_demo(duration: int) -> None:
     async with aiohttp.ClientSession() as http_session:
         signal_provider = CompositeSignalProvider([
             BinanceSignalProvider(http_session),
-            CoinbaseAnchorProvider(http_session),
+            PolymarketChainlinkSignalProvider(http_session),
         ])
         session = LiveDecisionSession(
             discovery=PolymarketDiscoveryProvider(http_session),
@@ -119,9 +120,9 @@ async def run_demo(duration: int) -> None:
             print(f"[state] chainlink_ticks  : {len(state.chainlink_ticks)}")
             print(f"[state] tape_ewma        : {round(state.tape_ewma, 6)}")
             if state.last_binance is not None:
-                print(f"[state] last BTC (Binance) : {state.last_binance.value}")
+                print(f"[state] last BTC (Binance)   : {state.last_binance.value}")
             if state.last_chainlink is not None:
-                print(f"[state] last BTC (Coinbase): {state.last_chainlink.value}")
+                print(f"[state] last BTC (Chainlink) : {state.last_chainlink.value}")
 
 
 def main(argv: list[str] | None = None) -> None:

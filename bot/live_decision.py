@@ -2,11 +2,11 @@
 Combined read-only orchestrator with non-executing strategy layer.
 
 LiveDecisionSession wires together:
-  LiveReadonlySession  — market book feed
-  LiveRTDSSession      — signal feed (Binance, or composite Binance+Coinbase)
-  FairValueEngine      — fair value computation (requires last_chainlink)
-  PTBLocker            — price-to-beat lock
-  Strategy             — produces DesiredQuotes
+  LiveReadonlySession              — market book feed
+  LiveRTDSSession                  — signal feed (Binance + Chainlink composite)
+  FairValueEngine                  — fair value computation (requires last_chainlink)
+  PTBLocker                        — price-to-beat lock
+  Strategy                         — produces DesiredQuotes
 
 Discovery is called exactly once. Both feeds share a single LocalState.
 The decision loop polls state every `decision_poll_ms` ms, fires when the
@@ -20,9 +20,10 @@ is None. The session catches this, increments skipped_fair_value_count, records
 last_fair_value_error, and continues.
 
 To produce real decisions in live operation, pass a CompositeSignalProvider
-combining BinanceSignalProvider + CoinbaseAnchorProvider as the signal_provider.
-Coinbase ticks fill the internal anchor slot (last_chainlink). This is a Coinbase
-price anchor, NOT a Chainlink oracle — documented here, not hidden.
+combining BinanceSignalProvider + PolymarketChainlinkSignalProvider. Chainlink
+ticks from the Polymarket RTDS feed (wss://ws-live-data.polymarket.com, topic
+crypto_prices_chainlink, no auth required) populate last_chainlink natively via
+RTDSMessageRouter → register_chainlink_tick(). Not on-chain Chainlink; no auth.
 
 With composite provider: decision_count > 0, skipped_fair_value_count == 0.
 Without anchor source: decision_count == 0, skipped counts explain why.

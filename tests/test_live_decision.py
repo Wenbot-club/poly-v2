@@ -69,9 +69,9 @@ def _binance_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[s
     }
 
 
-def _coinbase_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[str, Any]:
+def _chainlink_tick(value: float, seq: int, ts: int = 1_765_000_800_200) -> Dict[str, Any]:
     return {
-        "source": "coinbase",
+        "source": "chainlink",
         "symbol": "btc/usd",
         "timestamp_ms": ts,
         "recv_timestamp_ms": ts + 50,
@@ -490,18 +490,18 @@ def test_provider_exhausted_before_timeout_returns_normally():
 # Coinbase anchor unblocking — real FairValueEngine
 # ---------------------------------------------------------------------------
 
-def test_real_fair_value_produces_decisions_with_coinbase_anchor():
+def test_real_fair_value_produces_decisions_with_chainlink_anchor():
     """
-    Real FairValueEngine (no fake), Binance + Coinbase ticks, valid book.
-    Coinbase tick feeds last_chainlink via RTDSMessageRouter → fair value unblocked.
+    Real FairValueEngine (no fake), Binance + Chainlink ticks, valid book.
+    Chainlink tick feeds last_chainlink via RTDSMessageRouter → fair value unblocked.
     decision_count >= 1, skipped_fair_value_count == 0.
     """
     from bot.fair_value import FairValueEngine
 
     msgs = [_book_msg("YES_TOKEN", ts=1_765_000_800_100)]
     ticks = [
-        _coinbase_tick(42000.5, seq=1),  # routes to last_chainlink (anchor)
-        _binance_tick(42000.0, seq=1),   # routes to last_binance
+        _chainlink_tick(42000.5, seq=1),  # routes to last_chainlink
+        _binance_tick(42000.0, seq=1),    # routes to last_binance
     ]
     session = _make_session(
         market_messages=msgs,
@@ -514,12 +514,12 @@ def test_real_fair_value_produces_decisions_with_coinbase_anchor():
     assert summary.skipped_fair_value_count == 0
 
 
-def test_skipped_count_zero_with_coinbase_anchor():
+def test_skipped_count_zero_with_chainlink_anchor():
     """Explicit: no skips when anchor is wired — not just decision_count > 0."""
     from bot.fair_value import FairValueEngine
 
     msgs = [_book_msg("YES_TOKEN", ts=1_765_000_800_100)]
-    ticks = [_coinbase_tick(42000.0, seq=1), _binance_tick(42000.0, seq=1)]
+    ticks = [_chainlink_tick(42000.0, seq=1), _binance_tick(42000.0, seq=1)]
     session = _make_session(
         market_messages=msgs,
         rtds_ticks=ticks,
