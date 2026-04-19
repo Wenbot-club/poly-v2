@@ -127,11 +127,11 @@ class PTBDecision:
 class FairValueSnapshot:
     p_up: float
     p_down: float
-    z_score: float
+    z_score: float      # legacy field; new callers populate via gap_z
     sigma_60: float
     denom: float
-    lead_adj: float
-    micro_adj: float
+    lead_adj: float     # legacy field; new callers populate via signal_adj
+    micro_adj: float    # legacy field; set to 0.0 by new callers
     imbalance: float
     tape: float
     chainlink_last: float
@@ -139,6 +139,10 @@ class FairValueSnapshot:
     ptb: float
     tau_s: float
     timestamp_ms: int
+    # Additive fields (default 0.0 keeps existing construction sites unchanged)
+    gap_z: float = 0.0          # gap_usd / sigma_usd — dimensionless, used by strategy
+    signal_adj: float = 0.0     # clamp(K_SIGNAL * gap_z, ±SIGNAL_CAP) in prob space
+    sigma_usd: float = 0.0      # max(sigma_60, SIGMA_FLOOR_USD) — effective sigma
 
 
 @dataclass(slots=True)
