@@ -16,7 +16,7 @@ from bot.domain import (
     MarketContext,
     PTBDecision,
 )
-from bot.live_paper import LivePaperSession, LivePaperSummary
+from bot.live_paper import LivePaperSession, LivePaperSummary, _TAU_GATE_S
 from bot.settings import DEFAULT_CONFIG
 
 
@@ -30,8 +30,8 @@ def _make_mock_market() -> MarketContext:
         condition_id="0xbtc15mdemo",
         title="Bitcoin Up or Down - Demo 15m",
         slug="bitcoin-up-or-down-demo-15m",
-        start_ts_ms=1_765_000_800_000,
-        end_ts_ms=1_765_001_700_000,
+        start_ts_ms=1_900_000_800_000,   # ~year 2030 — stays future so expiry guards don't fire
+        end_ts_ms=1_900_001_700_000,
         yes_token_id="YES_TOKEN",
         no_token_id="NO_TOKEN",
         clob=ClobMarketInfo(
@@ -1432,3 +1432,95 @@ def test_initial_position_cost_basis_seeds_realized_pnl_accounting_correctly():
         assert summary.position_cost_basis == 0.0
         assert summary.final_up_free == 0.0
         assert summary.pnl_total_mark == summary.realized_pnl
+
+
+# ---------------------------------------------------------------------------
+# M15 rollover: window enforcement (PR #1)
+# ---------------------------------------------------------------------------
+
+# Mock market end_ts from _make_mock_market() = 1_765_001_700_000
+
+_END_TS = 1_900_001_700_000  # must match _make_mock_market().end_ts_ms
+
+
+def test_no_orders_when_run_starts_past_expiry():
+    """Session where now > end_ts makes no decisions and posts no orders."""
+    now_fn = lambda: _END_TS + 1_000
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    ticks = [_binance_tick(84000.0, seq=1), _chainlink_tick(84000.0, seq=1)]
+    session = _make_session(msgs, ticks, now_fn=now_fn)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted == 0
+    assert summary.decision_count == 0
+
+
+def test_near_expiry_gate_blocks_orders_under_tau_gate():
+    """tau_s < _TAU_GATE_S prevents any order from being posted."""
+    # _TAU_GATE_S = 30s; we sit 20s before end → tau = 20 < 30
+    now_fn = lambda: _END_TS - 20_000
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    ticks = [_binance_tick(84000.0, seq=1), _chainlink_tick(84000.0, seq=1)]
+    session = _make_session(msgs, ticks, now_fn=now_fn)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted == 0
+    posted = [e for e in session.events if e["event"] == "order_posted"]
+    assert posted == []
+
+
+def test_halt_cancels_open_bid_with_market_expired_reason():
+    """Order posted during normal window is cancelled with reason='market_expired' at expiry."""
+    # Phase 1: run normally (120s before end, tau = 120 >> 30)
+    normal_now = _END_TS - 120_000
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    ticks = [_binance_tick(84000.0, seq=1), _chainlink_tick(84000.0, seq=1)]
+    session = _make_session(msgs, ticks, now_fn=lambda: normal_now)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted >= 1, "precondition: order must be posted at normal time"
+
+    # Phase 2: advance clock past expiry and call _poll_and_execute directly
+    # (engine and user_queue survive until the next run_for resets them)
+    assert session.state is not None
+    session._poll_and_execute(session.state, _END_TS + 1_000)
+
+    cancel_events = [e for e in session.events if e["event"] == "order_cancelled"]
+    reasons = [e.get("reason") for e in cancel_events]
+    assert "market_expired" in reasons
+    assert session._trading_halted is True
+
+
+def test_near_expiry_cancels_open_bid_with_near_expiry_reason():
+    """Order posted during normal window is cancelled with reason='near_expiry'."""
+    normal_now = _END_TS - 120_000
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    ticks = [_binance_tick(84000.0, seq=1), _chainlink_tick(84000.0, seq=1)]
+    session = _make_session(msgs, ticks, now_fn=lambda: normal_now)
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.orders_posted >= 1, "precondition: order must be posted at normal time"
+
+    # Advance to 20s before end (tau = 20 < 30s gate)
+    assert session.state is not None
+    session._poll_and_execute(session.state, _END_TS - 20_000)
+
+    cancel_events = [e for e in session.events if e["event"] == "order_cancelled"]
+    reasons = [e.get("reason") for e in cancel_events]
+    assert "near_expiry" in reasons
+
+
+def test_trading_halted_flag_is_idempotent():
+    """After halt, further _poll_and_execute calls are no-ops."""
+    normal_now = _END_TS - 120_000
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    ticks = [_binance_tick(84000.0, seq=1), _chainlink_tick(84000.0, seq=1)]
+    session = _make_session(msgs, ticks, now_fn=lambda: normal_now)
+    asyncio.run(session.run_for(duration=5))
+    assert session.state is not None
+
+    # Trigger halt
+    session._poll_and_execute(session.state, _END_TS + 1_000)
+    assert session._trading_halted is True
+    cancels_after_halt = session._orders_cancelled
+
+    # Further calls must be no-ops
+    session._poll_and_execute(session.state, _END_TS + 2_000)
+    session._poll_and_execute(session.state, _END_TS + 3_000)
+    assert session._orders_cancelled == cancels_after_halt
