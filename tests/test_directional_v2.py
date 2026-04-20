@@ -139,6 +139,7 @@ def _make_config(
                 min_tau_to_enter_s=min_tau_to_enter_s,
                 force_exit_tau_s=force_exit_tau_s,
                 entry_notional_usd=entry_notional_usd,
+                chainlink_max_age_ms=chainlink_max_age_ms,
             ),
         )
     )

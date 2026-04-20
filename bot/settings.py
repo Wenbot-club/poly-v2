@@ -49,6 +49,7 @@ class DirectionalThresholds:
     force_exit_tau_s: float = 45.0
     entry_notional_usd: float = 5.0
     max_position_notional_usd: float = 25.0
+    chainlink_max_age_ms: float = 15_000.0
 
 
 @dataclass(frozen=True, slots=True)

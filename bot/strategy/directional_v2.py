@@ -75,7 +75,7 @@ class DirectionalPolicyV2:
             if now_ms - state.last_binance.recv_timestamp_ms > f.binance_max_age_ms.value:
                 return _disabled("binance_stale", now_ms, s)
         if state.last_chainlink is not None:
-            if now_ms - state.last_chainlink.recv_timestamp_ms > f.chainlink_max_age_ms.value:
+            if now_ms - state.last_chainlink.recv_timestamp_ms > d.chainlink_max_age_ms:
                 return _disabled("chainlink_stale", now_ms, s)
 
         if pos.qty > 0:
