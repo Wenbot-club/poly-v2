@@ -121,6 +121,14 @@ class LivePaperSummary:
     decisions_ptb_locked: int
     decisions_bid_enabled: int
     decisions_ask_enabled: int
+    decisions_in_flat: int
+    decisions_in_long: int
+    # Round-trip tracking
+    completed_round_trips: int
+    forced_exit_count: int
+    avg_holding_time_s: Optional[float]
+    max_holding_time_s: Optional[float]
+    last_exit_reason: Optional[str]
     # Data age at moment of decision (event timestamp age, not network latency)
     avg_binance_age_ms_at_decision: Optional[float]
     max_binance_age_ms_at_decision: Optional[int]
@@ -242,6 +250,13 @@ class LivePaperSession:
         self._decisions_ptb_locked: int = 0
         self._decisions_bid_enabled: int = 0
         self._decisions_ask_enabled: int = 0
+        self._decisions_in_flat: int = 0
+        self._decisions_in_long: int = 0
+        # Round-trip tracking
+        self._completed_round_trips: int = 0
+        self._forced_exit_count: int = 0
+        self._holding_times: list = []
+        self._last_exit_reason: Optional[str] = None
         # Age samples per decision
         self._binance_ages: list[int] = []
         self._chainlink_ages: list[int] = []
@@ -303,6 +318,8 @@ class LivePaperSession:
             self._position_qty = self._initial_up
             self._position_cost_basis = self._initial_position_cost_basis  # type: ignore[assignment]
             self._max_up_inventory = self._initial_up
+            state.position.qty = self._initial_up
+            state.position.cost_basis = self._initial_position_cost_basis  # type: ignore[assignment]
         cost_basis_at_start = self._initial_position_cost_basis or 0.0
         self._portfolio_value_start = pusd + cost_basis_at_start
 
@@ -404,6 +421,12 @@ class LivePaperSession:
         avg_fair_minus_bid = _avg(self._fair_minus_bid_samples)
         avg_ask_minus_fair = _avg(self._ask_minus_fair_samples)
 
+        avg_holding = (
+            sum(self._holding_times) / len(self._holding_times)
+            if self._holding_times else None
+        )
+        max_holding = max(self._holding_times) if self._holding_times else None
+
         self.events.append({
             "ts_ms": self._now_fn(),
             "event": "session_end",
@@ -423,6 +446,8 @@ class LivePaperSession:
             "decisions_ptb_locked": self._decisions_ptb_locked,
             "decisions_bid_enabled": self._decisions_bid_enabled,
             "decisions_ask_enabled": self._decisions_ask_enabled,
+            "decisions_in_flat": self._decisions_in_flat,
+            "decisions_in_long": self._decisions_in_long,
             "avg_binance_age_ms_at_decision": avg_binance_age,
             "max_binance_age_ms_at_decision": max_binance_age,
             "avg_chainlink_age_ms_at_decision": avg_chainlink_age,
@@ -476,6 +501,13 @@ class LivePaperSession:
             decisions_ptb_locked=self._decisions_ptb_locked,
             decisions_bid_enabled=self._decisions_bid_enabled,
             decisions_ask_enabled=self._decisions_ask_enabled,
+            decisions_in_flat=self._decisions_in_flat,
+            decisions_in_long=self._decisions_in_long,
+            completed_round_trips=self._completed_round_trips,
+            forced_exit_count=self._forced_exit_count,
+            avg_holding_time_s=avg_holding,
+            max_holding_time_s=max_holding,
+            last_exit_reason=self._last_exit_reason,
             avg_binance_age_ms_at_decision=avg_binance_age,
             max_binance_age_ms_at_decision=max_binance_age,
             avg_chainlink_age_ms_at_decision=avg_chainlink_age,
@@ -509,6 +541,8 @@ class LivePaperSession:
             self._position_qty = self._initial_up
             self._position_cost_basis = self._initial_position_cost_basis  # type: ignore[assignment]
             self._max_up_inventory = self._initial_up
+            state.position.qty = self._initial_up
+            state.position.cost_basis = self._initial_position_cost_basis  # type: ignore[assignment]
         cost_basis_at_start = self._initial_position_cost_basis or 0.0
         self._portfolio_value_start = pusd + cost_basis_at_start
 
@@ -641,6 +675,10 @@ class LivePaperSession:
                 self._decisions_bid_enabled += 1
             if desired.ask.enabled:
                 self._decisions_ask_enabled += 1
+            if desired.strategy_state == "long":
+                self._decisions_in_long += 1
+            else:
+                self._decisions_in_flat += 1
 
             # Data values for attribution
             binance_value: Optional[float] = (
@@ -715,6 +753,10 @@ class LivePaperSession:
                 "ask_reason": desired.ask.reason,
                 "ptb_locked": ptb.locked,
                 "ptb_value": ptb.ptb_value,
+                "strategy_state": desired.strategy_state,
+                "entry_edge": desired.entry_edge,
+                "pnl_per_share": desired.pnl_per_share,
+                "exit_candidate_reason": desired.exit_candidate_reason,
                 # Attribution
                 "binance_value": binance_value,
                 "chainlink_value": chainlink_value,
@@ -793,6 +835,8 @@ class LivePaperSession:
                         "side": desired.bid.side,
                         "price": desired.bid.price,
                         "size": desired.bid.size,
+                        "intent": "entry",
+                        "strategy_reason": desired.bid.reason,
                     })
                     print(f"[order] BID posted  price={desired.bid.price}  size={desired.bid.size}", flush=True)
                 self._drain_user_queue(state)
@@ -817,6 +861,8 @@ class LivePaperSession:
                             "order_id": current_bid_id,
                             "side": "BUY",
                             "reason": "reprice",
+                            "intent": "entry",
+                            "strategy_reason": desired.bid.reason,
                         })
                     order_id = self._engine.post_order(
                         state,
@@ -849,6 +895,8 @@ class LivePaperSession:
                             "side": desired.bid.side,
                             "price": desired.bid.price,
                             "size": desired.bid.size,
+                            "intent": "entry",
+                            "strategy_reason": desired.bid.reason,
                         })
                     self._drain_user_queue(state)
         else:
@@ -865,6 +913,8 @@ class LivePaperSession:
                         "order_id": current_bid_id,
                         "side": "BUY",
                         "reason": "bid_disabled",
+                        "intent": "entry",
+                        "strategy_reason": desired.bid.reason,
                     })
 
         # ---- ASK side -------------------------------------------------------
@@ -904,6 +954,8 @@ class LivePaperSession:
                         "side": desired.ask.side,
                         "price": desired.ask.price,
                         "size": desired.ask.size,
+                        "intent": "exit",
+                        "strategy_reason": desired.ask.reason,
                     })
                 self._drain_user_queue(state)
             else:
@@ -927,6 +979,8 @@ class LivePaperSession:
                             "order_id": current_ask_id,
                             "side": "SELL",
                             "reason": "reprice",
+                            "intent": "exit",
+                            "strategy_reason": desired.ask.reason,
                         })
                     order_id = self._engine.post_order(
                         state,
@@ -959,6 +1013,8 @@ class LivePaperSession:
                             "side": desired.ask.side,
                             "price": desired.ask.price,
                             "size": desired.ask.size,
+                            "intent": "exit",
+                            "strategy_reason": desired.ask.reason,
                         })
                     self._drain_user_queue(state)
         else:
@@ -975,6 +1031,8 @@ class LivePaperSession:
                         "order_id": current_ask_id,
                         "side": "SELL",
                         "reason": "ask_disabled",
+                        "intent": "exit",
+                        "strategy_reason": desired.ask.reason,
                     })
 
     def _check_fills(self, state: LocalState, now_ms: int) -> None:
@@ -1004,7 +1062,7 @@ class LivePaperSession:
                     if self._first_fill_ts_ms is None:
                         self._first_fill_ts_ms = now_ms
                     self._last_fill_ts_ms = now_ms
-                    self._accrue_buy_fill(fill_size, fill_price)
+                    self._accrue_buy_fill(state, fill_size, fill_price, now_ms)
                     self.events.append({
                         "ts_ms": now_ms,
                         "event": "fill_simulated",
@@ -1012,6 +1070,11 @@ class LivePaperSession:
                         "side": "BUY",
                         "fill_price": fill_price,
                         "fill_size": fill_size,
+                        "intent": "entry",
+                        "strategy_reason": (
+                            state.desired_quotes.bid.reason
+                            if state.desired_quotes is not None else None
+                        ),
                     })
                     print(
                         f"[FILL] BUY  price={fill_price:.3f}  size={fill_size:.1f}"
@@ -1038,7 +1101,18 @@ class LivePaperSession:
                     if self._first_fill_ts_ms is None:
                         self._first_fill_ts_ms = now_ms
                     self._last_fill_ts_ms = now_ms
-                    self._accrue_sell_fill(fill_size, fill_price)
+                    sell_reason = (
+                        state.desired_quotes.ask.reason
+                        if state.desired_quotes is not None else None
+                    )
+                    self._accrue_sell_fill(state, fill_size, fill_price, now_ms)
+                    self._last_exit_reason = sell_reason
+                    if sell_reason == "exit_force":
+                        self._forced_exit_count += 1
+                    if state.position.qty < 1e-12 and state.position.opened_at_ms is not None:
+                        holding_ms = now_ms - state.position.opened_at_ms
+                        self._holding_times.append(holding_ms / 1000.0)
+                        self._completed_round_trips += 1
                     self.events.append({
                         "ts_ms": now_ms,
                         "event": "fill_simulated",
@@ -1046,6 +1120,8 @@ class LivePaperSession:
                         "side": "SELL",
                         "fill_price": fill_price,
                         "fill_size": fill_size,
+                        "intent": "exit",
+                        "strategy_reason": sell_reason,
                     })
                     print(
                         f"[FILL] SELL  price={fill_price:.3f}  size={fill_size:.1f}"
@@ -1075,20 +1151,41 @@ class LivePaperSession:
             return str(state.logs[-1].payload.get("reason", "unknown"))
         return "unknown"
 
-    def _accrue_buy_fill(self, fill_size: float, fill_price: float) -> None:
+    def _accrue_buy_fill(
+        self, state: "LocalState", fill_size: float, fill_price: float, now_ms: int
+    ) -> None:
         self._position_qty += fill_size
         self._position_cost_basis += fill_price * fill_size
+        pos = state.position
+        pos.qty += fill_size
+        pos.cost_basis += fill_price * fill_size
+        if pos.opened_at_ms is None:
+            pos.opened_at_ms = now_ms
+        pos.last_entry_fill_ts_ms = now_ms
 
-    def _accrue_sell_fill(self, fill_size: float, fill_price: float) -> None:
+    def _accrue_sell_fill(
+        self, state: "LocalState", fill_size: float, fill_price: float, now_ms: int
+    ) -> None:
         if self._position_qty < 1e-12:
             return
         avg_cost = self._position_cost_basis / self._position_qty
-        self._realized_pnl += (fill_price - avg_cost) * fill_size
+        realized = (fill_price - avg_cost) * fill_size
+        self._realized_pnl += realized
         self._position_qty -= fill_size
         self._position_cost_basis -= avg_cost * fill_size
         if self._position_qty < 1e-12:
             self._position_qty = 0.0
             self._position_cost_basis = 0.0
+        pos = state.position
+        if pos.qty > 1e-12:
+            pos_avg = pos.cost_basis / pos.qty
+            pos.realized_pnl += (fill_price - pos_avg) * fill_size
+            pos.qty -= fill_size
+            pos.cost_basis -= pos_avg * fill_size
+            if pos.qty < 1e-12:
+                pos.qty = 0.0
+                pos.cost_basis = 0.0
+        pos.last_exit_fill_ts_ms = now_ms
 
     def _cancel_all_open_orders(
         self, state: LocalState, now_ms: int, reason: str
@@ -1109,6 +1206,8 @@ class LivePaperSession:
                         "order_id": order_id,
                         "side": side,
                         "reason": reason,
+                        "intent": "entry" if side == "BUY" else "exit",
+                        "strategy_reason": None,
                     })
 
     def _maybe_heartbeat(self, state: LocalState, now_ms: int) -> None:
@@ -1158,6 +1257,12 @@ class LivePaperSession:
         self._decisions_ptb_locked = 0
         self._decisions_bid_enabled = 0
         self._decisions_ask_enabled = 0
+        self._decisions_in_flat = 0
+        self._decisions_in_long = 0
+        self._completed_round_trips = 0
+        self._forced_exit_count = 0
+        self._holding_times = []
+        self._last_exit_reason = None
         self._binance_ages = []
         self._chainlink_ages = []
         self._book_event_ages = []

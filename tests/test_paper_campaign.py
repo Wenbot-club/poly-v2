@@ -114,6 +114,13 @@ def _make_fake_summary(**kw) -> LivePaperSummary:
         max_abs_binance_chainlink_gap_at_decision=None,
         avg_fair_minus_best_bid_at_decision=None,
         avg_best_ask_minus_fair_at_decision=None,
+        decisions_in_flat=0,
+        decisions_in_long=0,
+        completed_round_trips=0,
+        forced_exit_count=0,
+        avg_holding_time_s=None,
+        max_holding_time_s=None,
+        last_exit_reason=None,
     )
     defaults.update(kw)
     return LivePaperSummary(**defaults)
@@ -434,3 +441,136 @@ def test_gate_reason_aggregation_ignores_missing_bid_reason():
     result = _default_campaign_summary(all_events=events)
     assert result.by_bid_reason == {"tau_gate": 1}
     assert None not in result.by_bid_reason
+
+
+# ---------------------------------------------------------------------------
+# Test 9: strategy state counters aggregated correctly
+# ---------------------------------------------------------------------------
+
+def test_campaign_summary_aggregates_decisions_in_flat():
+    """total_decisions_in_flat sums decisions_in_flat across all session summaries."""
+    summaries = [
+        _make_fake_summary(decisions_in_flat=10, decisions_in_long=2),
+        _make_fake_summary(decisions_in_flat=8, decisions_in_long=5),
+        _make_fake_summary(decisions_in_flat=0, decisions_in_long=3),
+    ]
+    result = _default_campaign_summary(
+        session_summaries=summaries,
+        session_count_requested=3,
+    )
+    assert result.total_decisions_in_flat == 18
+    assert result.total_decisions_in_long == 10
+
+
+def test_campaign_summary_strategy_state_zero_when_no_sessions():
+    """Both strategy state counters are 0 when no sessions completed."""
+    result = _default_campaign_summary(session_summaries=[], session_count_requested=0)
+    assert result.total_decisions_in_flat == 0
+    assert result.total_decisions_in_long == 0
+
+
+def test_campaign_summary_strategy_state_independent_of_events():
+    """Strategy state counters come from session summaries, not from event fields."""
+    events = [_make_decision_event()]  # decision events have no strategy_state field
+    summaries = [_make_fake_summary(decisions_in_flat=7, decisions_in_long=1)]
+    result = _default_campaign_summary(
+        session_summaries=summaries,
+        all_events=events,
+        session_count_requested=1,
+    )
+    assert result.total_decisions_in_flat == 7
+    assert result.total_decisions_in_long == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 10: round-trip aggregation
+# ---------------------------------------------------------------------------
+
+def test_campaign_summary_aggregates_round_trips():
+    """total_completed_round_trips sums completed_round_trips across all sessions."""
+    summaries = [
+        _make_fake_summary(completed_round_trips=3, forced_exit_count=1),
+        _make_fake_summary(completed_round_trips=2, forced_exit_count=0),
+        _make_fake_summary(completed_round_trips=0, forced_exit_count=0),
+    ]
+    result = _default_campaign_summary(
+        session_summaries=summaries,
+        session_count_requested=3,
+    )
+    assert result.total_completed_round_trips == 5
+    assert result.total_forced_exits == 1
+
+
+def test_campaign_summary_round_trips_zero_when_no_sessions():
+    """Both round-trip counters are 0 when no sessions completed."""
+    result = _default_campaign_summary(session_summaries=[], session_count_requested=0)
+    assert result.total_completed_round_trips == 0
+    assert result.total_forced_exits == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 11: by_exit_reason tally from fill_simulated events
+# ---------------------------------------------------------------------------
+
+def _make_fill_event(*, side: str = "SELL", intent: str = "exit", strategy_reason: Optional[str] = "exit_take_profit_passive") -> Dict[str, Any]:
+    return {
+        "ts_ms": 1000,
+        "event": "fill_simulated",
+        "side": side,
+        "fill_price": 0.55,
+        "fill_size": 10.0,
+        "intent": intent,
+        "strategy_reason": strategy_reason,
+    }
+
+
+def test_by_exit_reason_tallied_from_fill_events():
+    """by_exit_reason counts fill_simulated events with intent=='exit'."""
+    events = [
+        _make_fill_event(strategy_reason="exit_take_profit_passive"),
+        _make_fill_event(strategy_reason="exit_take_profit_passive"),
+        _make_fill_event(strategy_reason="exit_stop_loss"),
+        _make_fill_event(strategy_reason="exit_force"),
+        _make_fill_event(intent="entry", strategy_reason="enter_long_passive"),  # excluded
+        _make_decision_event(),  # excluded (not fill)
+    ]
+    result = _default_campaign_summary(all_events=events)
+    assert result.by_exit_reason == {
+        "exit_take_profit_passive": 2,
+        "exit_stop_loss": 1,
+        "exit_force": 1,
+    }
+
+
+def test_by_exit_reason_empty_when_no_fills():
+    """by_exit_reason is empty dict when no fill events."""
+    result = _default_campaign_summary(all_events=[])
+    assert result.by_exit_reason == {}
+
+
+# ---------------------------------------------------------------------------
+# Test 12: avg_holding_time_s weighted average
+# ---------------------------------------------------------------------------
+
+def test_avg_holding_time_weighted_average():
+    """avg_holding_time_s is the round-trip-weighted average across sessions."""
+    summaries = [
+        _make_fake_summary(avg_holding_time_s=10.0, completed_round_trips=2),
+        _make_fake_summary(avg_holding_time_s=30.0, completed_round_trips=1),
+    ]
+    result = _default_campaign_summary(
+        session_summaries=summaries,
+        session_count_requested=2,
+    )
+    # weighted: (10*2 + 30*1) / (2+1) = 50/3 ≈ 16.667
+    assert result.avg_holding_time_s is not None
+    assert abs(result.avg_holding_time_s - 50.0 / 3.0) < 1e-9
+
+
+def test_avg_holding_time_none_when_no_round_trips():
+    """avg_holding_time_s is None when no sessions have completed round trips."""
+    summaries = [
+        _make_fake_summary(avg_holding_time_s=None, completed_round_trips=0),
+    ]
+    result = _default_campaign_summary(session_summaries=summaries, session_count_requested=1)
+    assert result.avg_holding_time_s is None

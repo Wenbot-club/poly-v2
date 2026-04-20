@@ -61,6 +61,14 @@ class CampaignSummary:
     chainlink_age_bucket_excluded_count: int
     # Gate reason breakdown: bid_reason → decision count across all sessions
     by_bid_reason: dict
+    # Strategy state counters across all sessions
+    total_decisions_in_flat: int
+    total_decisions_in_long: int
+    # Round-trip aggregates
+    total_completed_round_trips: int
+    total_forced_exits: int
+    avg_holding_time_s: Optional[float]
+    by_exit_reason: dict                   # exit strategy_reason → fill count across all sessions
 
 
 def _bucket_label(value: float, thresholds: tuple) -> str:
@@ -228,6 +236,35 @@ def compute_campaign_summary(
         if reason is not None:
             bid_reason_counts[reason] = bid_reason_counts.get(reason, 0) + 1
 
+    total_decisions_in_flat = sum(s.decisions_in_flat for s in session_summaries)
+    total_decisions_in_long = sum(s.decisions_in_long for s in session_summaries)
+
+    total_completed_round_trips = sum(s.completed_round_trips for s in session_summaries)
+    total_forced_exits = sum(s.forced_exit_count for s in session_summaries)
+
+    # Weighted average holding time across all round trips
+    weighted_sum = sum(
+        s.avg_holding_time_s * s.completed_round_trips
+        for s in session_summaries
+        if s.avg_holding_time_s is not None and s.completed_round_trips > 0
+    )
+    total_with_holding = sum(
+        s.completed_round_trips
+        for s in session_summaries
+        if s.avg_holding_time_s is not None and s.completed_round_trips > 0
+    )
+    avg_holding_time_s: Optional[float] = (
+        weighted_sum / total_with_holding if total_with_holding > 0 else None
+    )
+
+    # Exit reason tally from fill_simulated events with intent=="exit"
+    by_exit_reason: dict = {}
+    for ev in all_events:
+        if ev.get("event") == "fill_simulated" and ev.get("intent") == "exit":
+            reason = ev.get("strategy_reason")
+            if reason:
+                by_exit_reason[reason] = by_exit_reason.get(reason, 0) + 1
+
     return CampaignSummary(
         session_count_requested=session_count_requested,
         session_count_completed=n,
@@ -255,4 +292,10 @@ def compute_campaign_summary(
         gap_bucket_excluded_count=gap_excluded,
         chainlink_age_bucket_excluded_count=age_excluded,
         by_bid_reason=bid_reason_counts,
+        total_decisions_in_flat=total_decisions_in_flat,
+        total_decisions_in_long=total_decisions_in_long,
+        total_completed_round_trips=total_completed_round_trips,
+        total_forced_exits=total_forced_exits,
+        avg_holding_time_s=avg_holding_time_s,
+        by_exit_reason=by_exit_reason,
     )

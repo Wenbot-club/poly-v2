@@ -31,7 +31,7 @@ from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalP
 from bot.providers.polymarket_discovery import PolymarketDiscoveryProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_CONFIG
-from bot.strategy.baseline import QuotePolicy
+from bot.strategy.directional_v2 import DirectionalPolicyV2
 
 
 def _print_campaign_summary(cs: CampaignSummary) -> None:
@@ -95,6 +95,13 @@ def _print_campaign_summary(cs: CampaignSummary) -> None:
     for trigger, stats in cs.by_trigger.items():
         print(f"  {trigger:>6}: decisions={stats.decision_count}")
 
+    print("\n  [strategy state breakdown]")
+    total_d = cs.total_decisions_in_flat + cs.total_decisions_in_long
+    flat_pct = 100.0 * cs.total_decisions_in_flat / total_d if total_d else 0.0
+    long_pct = 100.0 * cs.total_decisions_in_long / total_d if total_d else 0.0
+    print(f"  {'flat':>6}: {cs.total_decisions_in_flat:>6}  ({flat_pct:.1f}%)")
+    print(f"  {'long':>6}: {cs.total_decisions_in_long:>6}  ({long_pct:.1f}%)")
+
     print("\n  [gate reason breakdown  bid_reason per decision]")
     total_decisions = sum(cs.by_bid_reason.values())
     for reason, count in sorted(cs.by_bid_reason.items(), key=lambda kv: -kv[1]):
@@ -119,6 +126,7 @@ async def run_campaign(
     print("  Paper campaign")
     print(f"  Sessions : {session_count} × {session_duration}s")
     print(f"  Signal   : Binance aggTrade + Polymarket RTDS Chainlink")
+    print(f"  Strategy : DirectionalPolicyV2 (FLAT/LONG state machine)")
     print(f"  Engine   : MockExecutionEngine (no real orders)")
     print(f"  Capital  : {DEFAULT_CONFIG.default_working_capital_usd} PUSD / session")
     print(f"  Output   : {output_dir}")
@@ -134,7 +142,7 @@ async def run_campaign(
                 discovery=PolymarketDiscoveryProvider(http_session),
                 market_provider=PolymarketMarketDataProvider(http_session),
                 signal_provider=signal_provider,
-                strategy=QuotePolicy(config=DEFAULT_CONFIG),
+                strategy=DirectionalPolicyV2(config=DEFAULT_CONFIG),
                 config=DEFAULT_CONFIG,
             )
 
