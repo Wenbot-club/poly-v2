@@ -69,3 +69,41 @@ class RuntimeConfig:
 
 
 DEFAULT_CONFIG = RuntimeConfig()
+
+
+@dataclass(frozen=True, slots=True)
+class M5Config:
+    # Window
+    window_seconds: int = 300
+    # PTB: don't attempt before window_ts + this delay
+    ptb_fetch_delay_s: float = 15.0
+    # EARLY entry window [start, end)
+    early_window_start_s: float = 140.0
+    early_window_end_s: float = 170.0
+    early_consensus_threshold: float = 88.0
+    early_min_non_neutral: int = 3
+    early_poll_interval_s: float = 0.5
+    # Baseline entry
+    baseline_elapsed_s: float = 170.0
+    # Sizing
+    leg1_bet_usd: float = 1.00
+    hedge_bet_usd: float = 2.00
+    # Hedge trigger (Binance only, no confirmation)
+    hedge_threshold: float = 1.0
+    hedge_cutoff_s: float = 250.0
+    # Paper execution — FOK then FAK loop
+    fok_price_offset: float = 0.05
+    fok_max_price_leg1: float = 0.95   # cap for LEG1 FOK attempt
+    fak_price_offset: float = 0.15
+    fak_max_price: float = 0.99
+    fak_duration_s: float = 10.0
+    fak_retry_interval_s: float = 1.0
+    price_insane_threshold: float = 0.995   # refuse if best_ask >= this
+    # Token price background polling
+    token_price_refresh_s: float = 2.0
+    # Settlement
+    settlement_poll_s: float = 5.0
+    settlement_timeout_s: float = 60.0
+
+
+DEFAULT_M5_CONFIG = M5Config()
