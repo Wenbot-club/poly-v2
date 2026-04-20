@@ -1,5 +1,5 @@
 """
-BTC M5 strategy tests — 40 tests across 7 groups.
+BTC M5 strategy tests — 45 tests across 8 groups.
 
 Tests 1-4   : PTB fetching (SSR, API, Chainlink fallback, stale rejection)
 Tests 5-15  : Probabilistic entry model (sigma, score, entry gates)
@@ -11,6 +11,7 @@ Tests 28-29 : Aggregate summary (counters + model diagnostics)
 Tests 30-31 : LEG1/HEDGE trace independence + settlement with both legs
 Tests 32-34 : Integration (model fields on record, block counts in summary)
 Tests 35-41 : Consecutive windows — scheduler, prefetch, resolution
+Tests 42-46 : PTB and window audit fields
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from bot.m5_session import (
     fetch_ptb,
     fetch_ptb_ssr,
     fetch_ptb_api,
+    fetch_ptb_full,
     fetch_close_price,
 )
 
@@ -710,7 +712,7 @@ def test_fetch_close_price_returns_on_first_success():
     window_ts = 1_000_000
     window_end_s = float(window_ts + 300)
     t = window_end_s + 15.1  # already past first_poll_time
-    price, attempts, latency_s = asyncio.run(
+    price, open_price, attempts, latency_s = asyncio.run(
         fetch_close_price(
             http, window_ts,
             polymarket_base_url="https://fake",
@@ -734,7 +736,7 @@ def test_fetch_close_price_exhausted_returns_none():
     })
     window_ts = 1_000_000
     window_end_s = float(window_ts + 300)
-    price, attempts, latency_s = asyncio.run(
+    price, open_price, attempts, latency_s = asyncio.run(
         fetch_close_price(
             http, window_ts,
             polymarket_base_url="https://fake",
@@ -746,6 +748,7 @@ def test_fetch_close_price_exhausted_returns_none():
         )
     )
     assert price is None
+    assert open_price is None
     assert attempts == 5
     assert latency_s is None
 
@@ -770,7 +773,7 @@ def test_fetch_close_price_waits_initial_delay():
     times = iter([window_end_s + 5.0, window_end_s + 15.1, window_end_s + 15.2])
 
     with patch("bot.m5_session.asyncio.sleep", side_effect=_tracking_sleep):
-        price, attempts, _ = asyncio.run(
+        price, _, attempts, _ = asyncio.run(
             fetch_close_price(
                 http, window_ts,
                 polymarket_base_url="https://fake",
@@ -846,3 +849,128 @@ def test_next_tokens_task_launched_after_trading_phases():
     )
     asyncio.run(session.run(window_ts))
     assert session.next_tokens_task is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests 42-46 : PTB and window audit fields
+# ---------------------------------------------------------------------------
+
+def test_window_audit_timestamps_derived_from_window_ts():
+    """window_start_utc_iso and window_end_utc_iso are correctly derived from window_ts."""
+    import datetime
+    window_ts = 1_746_000_000  # a valid unix timestamp
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 404},
+        "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": "85000.0"}},
+    })
+    wts = window_ts
+    times = iter([
+        wts + 15.1,
+        wts + 170.1, wts + 170.1, wts + 170.1,
+        wts + 300.1, wts + 300.1,
+    ])
+    session = _make_session(
+        signal=M5SignalState(btc_price=None),
+        http=http,
+        time_fn=lambda: next(times, wts + 310.0),
+        prefetched_tokens=("up_tok", "dn_tok"),
+    )
+    record = asyncio.run(session.run(window_ts))
+
+    expected_start = datetime.datetime.fromtimestamp(window_ts, tz=datetime.timezone.utc).isoformat()
+    expected_end = datetime.datetime.fromtimestamp(window_ts + 300, tz=datetime.timezone.utc).isoformat()
+    assert record.window_start_utc_iso == expected_start
+    assert record.window_end_utc_iso == expected_end
+
+
+def test_window_audit_event_slug_derived_from_window_ts():
+    """event_slug is set to 'btc-updown-5m-{window_ts}' regardless of token discovery."""
+    window_ts = 1_746_000_300
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 404},
+        "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": "85000.0"}},
+    })
+    wts = window_ts
+    times = iter([
+        wts + 15.1,
+        wts + 170.1, wts + 170.1, wts + 170.1,
+        wts + 300.1, wts + 300.1,
+    ])
+    session = _make_session(
+        signal=M5SignalState(btc_price=None),
+        http=http,
+        time_fn=lambda: next(times, wts + 310.0),
+        prefetched_tokens=("up_tok", "dn_tok"),
+    )
+    record = asyncio.run(session.run(window_ts))
+    assert record.event_slug == f"btc-updown-5m-{window_ts}"
+
+
+def test_fetch_ptb_full_ssr_takes_priority():
+    """fetch_ptb_full returns SSR value as primary when both SSR and API are available."""
+    ssr_price = 84000.0
+    api_price = 84050.0
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 200, "text": f'{{"openPrice": "{ssr_price}"}}'},
+        "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": str(api_price)}},
+    })
+    ptb, source, ptb_ssr, ptb_api, ptb_cl = asyncio.run(
+        fetch_ptb_full(http, 1_746_000_000, polymarket_base_url="https://fake")
+    )
+    assert source == "ssr"
+    assert ptb == pytest.approx(ssr_price)
+    assert ptb_ssr == pytest.approx(ssr_price)
+    assert ptb_api == pytest.approx(api_price)
+    assert ptb_cl is None
+
+
+def test_fetch_ptb_full_delta_sign():
+    """fetch_ptb_full returns correct raw ssr/api values for delta calculation."""
+    ssr_price = 84000.0
+    api_price = 84100.0
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 200, "text": f'{{"openPrice": "{ssr_price}"}}'},
+        "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": str(api_price)}},
+    })
+    _ptb, _src, ptb_ssr, ptb_api, _cl = asyncio.run(
+        fetch_ptb_full(http, 1_746_000_000, polymarket_base_url="https://fake")
+    )
+    delta = round(ptb_ssr - ptb_api, 2)
+    assert delta == pytest.approx(-100.0)
+
+
+def test_resolution_audit_fields_stored_on_record():
+    """resolution_open_price_api and resolution_close_price_api are stored on the record."""
+    window_ts = 1_000_000
+    open_p = 84000.0
+    close_p = 84500.0
+    wts = window_ts
+    # PTB via API (SSR 404), and same endpoint returns closePrice at settlement
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 404},
+        "/api/crypto/crypto-price": {"status": 200, "json": {
+            "openPrice": str(open_p),
+            "closePrice": str(close_p),
+        }},
+    })
+    cfg = M5Config(
+        entry_scan_start_s=0.0,      # skip early scan
+        entry_scan_end_s=0.0,
+        baseline_elapsed_s=0.0,      # baseline fires immediately
+        hedge_threshold=999.0,       # no hedge
+        settlement_initial_delay_s=0.0,
+        settlement_poll_s=0.0,
+        settlement_max_attempts=5,
+    )
+    session = _make_session(
+        signal=M5SignalState(btc_price=84100.0),  # above ptb → UP direction
+        http=http,
+        cfg=cfg,
+        time_fn=lambda: wts + 300.1,  # always past window end
+        prefetched_tokens=("up_tok", "dn_tok"),
+        token_prices={"up_tok": 0.60, "dn_tok": 0.40},
+    )
+    record = asyncio.run(session.run(window_ts))
+    assert record.entry_side == "up"  # sanity: entry did happen
+    assert record.resolution_close_price_api == pytest.approx(close_p)
+    assert record.resolution_open_price_api == pytest.approx(open_p)

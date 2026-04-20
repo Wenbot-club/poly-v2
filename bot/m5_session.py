@@ -23,6 +23,7 @@ Paper execution model (simplified):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import math
 import re
@@ -168,6 +169,38 @@ async def fetch_ptb(
     return None, None
 
 
+async def fetch_ptb_full(
+    http: aiohttp.ClientSession,
+    window_ts: int,
+    chainlink_price: Optional[float] = None,
+    chainlink_age_s: Optional[float] = None,
+    *,
+    polymarket_base_url: str = _POLY_BASE,
+    chainlink_max_age_s: float = 60.0,
+) -> tuple:  # (ptb, source, ssr_val, api_val, chainlink_val)
+    """
+    Like fetch_ptb() but always attempts both SSR and API for audit purposes.
+    Returns (selected_ptb, source, ptb_ssr, ptb_api, ptb_chainlink).
+    Selection order: SSR → API → Chainlink.
+    """
+    ptb_ssr = await fetch_ptb_ssr(http, window_ts, polymarket_base_url)
+    ptb_api = await fetch_ptb_api(http, window_ts, polymarket_base_url)
+
+    ptb_cl = None
+    if (chainlink_price is not None
+            and chainlink_age_s is not None
+            and chainlink_age_s < chainlink_max_age_s):
+        ptb_cl = chainlink_price
+
+    if ptb_ssr is not None:
+        return ptb_ssr, "ssr", ptb_ssr, ptb_api, ptb_cl
+    if ptb_api is not None:
+        return ptb_api, "api", ptb_ssr, ptb_api, ptb_cl
+    if ptb_cl is not None:
+        return ptb_cl, "chainlink", ptb_ssr, ptb_api, ptb_cl
+    return None, None, ptb_ssr, ptb_api, ptb_cl
+
+
 # ---------------------------------------------------------------------------
 # Token discovery
 # ---------------------------------------------------------------------------
@@ -270,14 +303,16 @@ async def fetch_close_price(
                     data = await resp.json(content_type=None)
                     v = data.get("closePrice")
                     if v is not None:
+                        open_v = data.get("openPrice")
                         latency_s = time_fn() - window_end_s
-                        return float(v), attempt, latency_s
+                        open_price = float(open_v) if open_v is not None else None
+                        return float(v), open_price, attempt, latency_s
         except Exception:
             pass
         if attempt < settlement_max_attempts:
             await asyncio.sleep(settlement_poll_s)
 
-    return None, settlement_max_attempts, None
+    return None, None, settlement_max_attempts, None
 
 
 # ---------------------------------------------------------------------------
@@ -342,24 +377,48 @@ class M5Session:
     async def run(self, window_ts: int) -> TradeRecord:
         record = TradeRecord(window_ts=window_ts)
 
+        # Populate window audit fields immediately
+        ws = self._cfg.window_seconds
+        wstart = datetime.datetime.fromtimestamp(window_ts, tz=datetime.timezone.utc)
+        wend = wstart + datetime.timedelta(seconds=ws)
+        record.window_start_utc_iso = wstart.isoformat()
+        record.window_end_utc_iso = wend.isoformat()
+        record.window_start_local_iso = datetime.datetime.fromtimestamp(window_ts).isoformat()
+        record.window_end_local_iso = datetime.datetime.fromtimestamp(window_ts + ws).isoformat()
+        record.event_slug = f"btc-updown-5m-{window_ts}"
+
         # Phase 1: wait until PTB fetch is safe
         await self._sleep_until(window_ts + self._cfg.ptb_fetch_delay_s)
 
-        # Phase 2: fetch PTB
+        # Phase 2: fetch PTB (full audit — always tries both SSR and API)
         cl_price = self._signals.chainlink_price
         cl_age_s: Optional[float] = None
         if cl_price is not None and self._signals.chainlink_price_ts_ms is not None:
             cl_age_s = (self._time_fn() - self._signals.chainlink_price_ts_ms / 1000.0)
 
-        ptb, ptb_source = await fetch_ptb(
+        ptb, ptb_source, ptb_ssr, ptb_api, ptb_cl = await fetch_ptb_full(
             self._http, window_ts, cl_price, cl_age_s,
             polymarket_base_url=self._poly_url,
         )
+        # Populate PTB audit fields
+        record.ptb_ssr = ptb_ssr
+        record.ptb_api = ptb_api
+        record.ptb_chainlink = ptb_cl
+        record.ptb_ssr_api_delta_usd = (
+            round(ptb_ssr - ptb_api, 2)
+            if ptb_ssr is not None and ptb_api is not None else None
+        )
+
         if ptb is None:
             record.abort_reason = "ptb_unavailable"
             return record
         record.ptb = ptb
         record.ptb_source = ptb_source
+        record.ptb_selected = ptb
+        record.ptb_selected_source = ptb_source
+        record.ptb_selected_api_delta_usd = (
+            round(ptb - ptb_api, 2) if ptb_api is not None else None
+        )
 
         # Phase 3: token discovery (use prefetch cache if available)
         if self._prefetched_tokens is not None:
@@ -397,7 +456,7 @@ class M5Session:
         window_end_s = window_ts + self._cfg.window_seconds
 
         if record.entry_side is not None and record.entry_price is not None:
-            close_price, attempts, latency_s = await fetch_close_price(
+            close_price, open_price_api, attempts, latency_s = await fetch_close_price(
                 self._http, window_ts,
                 polymarket_base_url=self._poly_url,
                 window_end_s=window_end_s,
@@ -409,6 +468,8 @@ class M5Session:
             record.resolution_attempts = attempts
             record.resolution_source = "api" if close_price is not None else None
             record.resolution_latency_s = latency_s
+            record.resolution_open_price_api = open_price_api
+            record.resolution_close_price_api = close_price
             if close_price is not None:
                 s = compute_settlement(
                     close_price=close_price,

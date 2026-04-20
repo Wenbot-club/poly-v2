@@ -87,7 +87,19 @@ def _first_m5_window_ts(cfg: M5Config, time_fn=_time.time) -> int:
 
 def _print_record(record: TradeRecord) -> None:
     print(f"\n{'=' * 55}")
-    print(f"  Window {record.window_ts}  PTB={record.ptb} ({record.ptb_source})")
+    # Window audit
+    if record.window_start_utc_iso and record.window_end_utc_iso:
+        start_t = record.window_start_utc_iso[11:19]  # HH:MM:SS
+        end_t = record.window_end_utc_iso[11:19]
+        date_part = record.window_start_utc_iso[:10]
+        print(f"  window : {date_part} {start_t}Z -> {end_t}Z")
+    if record.event_slug:
+        print(f"  slug   : {record.event_slug}")
+    # PTB audit
+    api_str = f"{record.ptb_api:.2f}" if record.ptb_api is not None else "n/a"
+    delta_str = f"{record.ptb_selected_api_delta_usd:+.2f}" if record.ptb_selected_api_delta_usd is not None else "n/a"
+    print(f"  ptb    : selected={record.ptb}  source={record.ptb_source}"
+          f"  api={api_str}  delta={delta_str}")
     if record.abort_reason:
         print(f"  ABORTED: {record.abort_reason}")
         return
@@ -119,6 +131,8 @@ def _print_record(record: TradeRecord) -> None:
               f"  latency={record.resolution_latency_s:.1f}s")
     else:
         print(f"  resolution: attempts={record.resolution_attempts}  latency=n/a")
+    if record.resolution_open_price_api is not None or record.resolution_close_price_api is not None:
+        print(f"  res_prices: open={record.resolution_open_price_api}  close={record.resolution_close_price_api}")
     print(f"  result : {record.result}  pnl_leg1={record.pnl_leg1}  "
           f"pnl_hedge={record.pnl_hedge}  net={record.net_pnl}")
 
