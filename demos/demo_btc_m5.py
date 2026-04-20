@@ -137,6 +137,43 @@ def _print_record(record: TradeRecord) -> None:
           f"pnl_hedge={record.pnl_hedge}  net={record.net_pnl}")
 
 
+def _print_running_totals(s: "M5CampaignSummary") -> None:
+    def _fmt_float(v, fmt=".4f") -> str:
+        if v is None:
+            return "n/a"
+        return f"{v:{fmt}}"
+
+    def _fmt_pnl(v) -> str:
+        if v is None:
+            return "n/a"
+        return f"{v:+.4f}"
+
+    print(f"\n{'─' * 55}")
+    print("  [running totals]")
+    print(f"  windows_resolved      : {s.windows_resolved}")
+    print(f"  leg1_entered          : {s.leg1_entered_count}")
+    print(f"    early               : {s.early_entry_count}")
+    print(f"    baseline            : {s.baseline_entry_count}")
+    print(f"  hedge_triggered       : {s.hedge_triggered_count}")
+    print(f"  hedge_cutoff_blocks   : {s.hedge_blocked_by_cutoff_count}")
+    print()
+    print(f"  pnl_leg1_total        : {_fmt_pnl(s.pnl_leg1_total)}")
+    print(f"  pnl_hedge_total       : {_fmt_pnl(s.pnl_hedge_total)}")
+    print(f"  net_pnl_total         : {_fmt_pnl(s.net_pnl_total)}")
+    print()
+    print(f"  avg_leg1_price        : {_fmt_float(s.avg_leg1_entry_price)}")
+    print(f"  avg_hedge_price       : {_fmt_float(s.avg_hedge_entry_price)}")
+    print(f"  avg_resolution_lat    : {_fmt_float(s.avg_resolution_latency_s, '.1f')}")
+    print(f"  prefetch_token_hits   : {s.prefetched_token_hits}")
+    if s.avg_p_model_up_at_entry is not None:
+        print(f"  avg_p_model_up        : {s.avg_p_model_up_at_entry:.3f}")
+    if s.blocked_by_noise_zone_count or s.blocked_by_edge_count or s.blocked_by_probability_count:
+        print(f"  blocked(noise/edge/p) : "
+              f"{s.blocked_by_noise_zone_count}/"
+              f"{s.blocked_by_edge_count}/"
+              f"{s.blocked_by_probability_count}")
+
+
 async def run_campaign(
     window_count: int,
     output_dir: Path,
@@ -198,6 +235,7 @@ async def run_campaign(
                 trades.append(record)
 
                 _print_record(record)
+                _print_running_totals(aggregate_trades(trades))
 
                 # Capture the prefetch task launched inside run() for the next window
                 next_tokens_cache_window_ts = wts + cfg.window_seconds

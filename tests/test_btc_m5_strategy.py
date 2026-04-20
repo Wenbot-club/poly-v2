@@ -1,5 +1,5 @@
 """
-BTC M5 strategy tests — 52 tests across 9 groups.
+BTC M5 strategy tests — 53 tests across 10 groups.
 
 Tests 1-4   : PTB fetching (SSR, API, Chainlink fallback, stale rejection)
 Tests 5-15  : Probabilistic entry model (sigma, score, entry gates)
@@ -13,6 +13,7 @@ Tests 32-34 : Integration (model fields on record, block counts in summary)
 Tests 35-41 : Consecutive windows — scheduler, prefetch, resolution
 Tests 42-46 : PTB and window audit fields
 Tests 47-52 : PTB hardening — SSR context anchor, delta guard, retry, Chainlink last resort
+Test  53    : Running campaign totals — windows_resolved counter
 """
 from __future__ import annotations
 
@@ -1114,3 +1115,26 @@ def test_ptb_robust_skip_window_if_all_sources_fail():
     assert record.abort_reason == "ptb_unavailable"
     assert record.ptb_attempts == 2
     assert record.ptb is None
+
+
+# ---------------------------------------------------------------------------
+# Test 53 : Running campaign totals
+# ---------------------------------------------------------------------------
+
+def test_aggregate_windows_resolved_counts_only_settled_windows():
+    """windows_resolved is the count of trades with result != None."""
+    trades = [
+        TradeRecord(window_ts=1000, result="up",   pnl_leg1=0.40, pnl_hedge=0.0, net_pnl=0.40,
+                    entry_side="up", entry_mode="early"),
+        TradeRecord(window_ts=2000, result="down",  pnl_leg1=-1.0, pnl_hedge=0.0, net_pnl=-1.0,
+                    entry_side="up", entry_mode="baseline"),
+        TradeRecord(window_ts=3000, abort_reason="ptb_unavailable"),   # no result
+        TradeRecord(window_ts=4000, result="up",   pnl_leg1=0.50, pnl_hedge=0.0, net_pnl=0.50,
+                    entry_side="up", entry_mode="early"),
+    ]
+    s = aggregate_trades(trades)
+    assert s.windows_seen == 4
+    assert s.windows_resolved == 3    # only the 3 with result != None
+    assert s.leg1_entered_count == 3
+    assert s.early_entry_count == 2
+    assert s.baseline_entry_count == 1
