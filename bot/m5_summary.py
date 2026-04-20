@@ -103,6 +103,7 @@ class TradeRecord:
 @dataclass
 class M5CampaignSummary:
     windows_seen: int
+    windows_resolved: int           # windows with result != None
     ptb_fail_count: int
     token_setup_fail_count: int
     leg1_entered_count: int
@@ -151,6 +152,7 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
 
     return M5CampaignSummary(
         windows_seen=len(trades),
+        windows_resolved=sum(1 for t in trades if t.result is not None),
         ptb_fail_count=sum(1 for t in trades if t.abort_reason == "ptb_unavailable"),
         token_setup_fail_count=sum(1 for t in trades if t.abort_reason == "tokens_unavailable"),
         leg1_entered_count=len(entered),
