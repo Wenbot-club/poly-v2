@@ -161,6 +161,26 @@ class DesiredQuotes:
     mode: str
     inventory_skew: float
     timestamp_ms: int
+    # Strategy metadata (optional; defaults keep existing construction sites valid)
+    strategy_state: str = "flat"
+    entry_edge: Optional[float] = None
+    pnl_per_share: Optional[float] = None
+    exit_candidate_reason: Optional[str] = None
+
+
+@dataclass
+class PositionState:
+    """Directional position tracking; updated by live_paper on fills, read by strategy."""
+    qty: float = 0.0
+    cost_basis: float = 0.0
+    realized_pnl: float = 0.0
+    opened_at_ms: Optional[int] = None
+    last_entry_fill_ts_ms: Optional[int] = None
+    last_exit_fill_ts_ms: Optional[int] = None
+
+    @property
+    def avg_cost(self) -> float:
+        return self.cost_basis / self.qty if self.qty > 0 else 0.0
 
 
 @dataclass(slots=True)
@@ -246,6 +266,7 @@ class LocalState:
     fair_value: Optional[FairValueSnapshot] = None
     desired_quotes: Optional[DesiredQuotes] = None
     inventory: InventoryState = field(default_factory=InventoryState)
+    position: PositionState = field(default_factory=PositionState)
     tape_ewma: float = 0.0
     simulated_now_ms: Optional[int] = None
     open_orders: Dict[str, LiveOrder] = field(default_factory=dict)

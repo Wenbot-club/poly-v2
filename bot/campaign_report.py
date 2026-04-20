@@ -61,6 +61,9 @@ class CampaignSummary:
     chainlink_age_bucket_excluded_count: int
     # Gate reason breakdown: bid_reason → decision count across all sessions
     by_bid_reason: dict
+    # Strategy state counters across all sessions
+    total_decisions_in_flat: int
+    total_decisions_in_long: int
 
 
 def _bucket_label(value: float, thresholds: tuple) -> str:
@@ -228,6 +231,9 @@ def compute_campaign_summary(
         if reason is not None:
             bid_reason_counts[reason] = bid_reason_counts.get(reason, 0) + 1
 
+    total_decisions_in_flat = sum(s.decisions_in_flat for s in session_summaries)
+    total_decisions_in_long = sum(s.decisions_in_long for s in session_summaries)
+
     return CampaignSummary(
         session_count_requested=session_count_requested,
         session_count_completed=n,
@@ -255,4 +261,6 @@ def compute_campaign_summary(
         gap_bucket_excluded_count=gap_excluded,
         chainlink_age_bucket_excluded_count=age_excluded,
         by_bid_reason=bid_reason_counts,
+        total_decisions_in_flat=total_decisions_in_flat,
+        total_decisions_in_long=total_decisions_in_long,
     )

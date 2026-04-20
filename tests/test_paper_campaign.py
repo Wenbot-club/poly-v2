@@ -114,6 +114,8 @@ def _make_fake_summary(**kw) -> LivePaperSummary:
         max_abs_binance_chainlink_gap_at_decision=None,
         avg_fair_minus_best_bid_at_decision=None,
         avg_best_ask_minus_fair_at_decision=None,
+        decisions_in_flat=0,
+        decisions_in_long=0,
     )
     defaults.update(kw)
     return LivePaperSummary(**defaults)
@@ -434,3 +436,42 @@ def test_gate_reason_aggregation_ignores_missing_bid_reason():
     result = _default_campaign_summary(all_events=events)
     assert result.by_bid_reason == {"tau_gate": 1}
     assert None not in result.by_bid_reason
+
+
+# ---------------------------------------------------------------------------
+# Test 9: strategy state counters aggregated correctly
+# ---------------------------------------------------------------------------
+
+def test_campaign_summary_aggregates_decisions_in_flat():
+    """total_decisions_in_flat sums decisions_in_flat across all session summaries."""
+    summaries = [
+        _make_fake_summary(decisions_in_flat=10, decisions_in_long=2),
+        _make_fake_summary(decisions_in_flat=8, decisions_in_long=5),
+        _make_fake_summary(decisions_in_flat=0, decisions_in_long=3),
+    ]
+    result = _default_campaign_summary(
+        session_summaries=summaries,
+        session_count_requested=3,
+    )
+    assert result.total_decisions_in_flat == 18
+    assert result.total_decisions_in_long == 10
+
+
+def test_campaign_summary_strategy_state_zero_when_no_sessions():
+    """Both strategy state counters are 0 when no sessions completed."""
+    result = _default_campaign_summary(session_summaries=[], session_count_requested=0)
+    assert result.total_decisions_in_flat == 0
+    assert result.total_decisions_in_long == 0
+
+
+def test_campaign_summary_strategy_state_independent_of_events():
+    """Strategy state counters come from session summaries, not from event fields."""
+    events = [_make_decision_event()]  # decision events have no strategy_state field
+    summaries = [_make_fake_summary(decisions_in_flat=7, decisions_in_long=1)]
+    result = _default_campaign_summary(
+        session_summaries=summaries,
+        all_events=events,
+        session_count_requested=1,
+    )
+    assert result.total_decisions_in_flat == 7
+    assert result.total_decisions_in_long == 1

@@ -1524,3 +1524,152 @@ def test_trading_halted_flag_is_idempotent():
     session._poll_and_execute(session.state, _END_TS + 2_000)
     session._poll_and_execute(session.state, _END_TS + 3_000)
     assert session._orders_cancelled == cancels_after_halt
+
+
+# ---------------------------------------------------------------------------
+# DirectionalPolicyV2 integration — position sync on fills (new for PR)
+# ---------------------------------------------------------------------------
+
+def _make_minimal_state():
+    """LocalState with a valid YES book; suitable for direct method testing."""
+    from bot.domain import (
+        BestBidAsk, ClobMarketInfo, ClobToken, LocalState, MarketContext, TokenBook
+    )
+    clob = ClobMarketInfo(
+        tokens=[ClobToken(token_id="YES_TOKEN", outcome="Yes")],
+        min_order_size=1.0,
+        min_tick_size=0.01,
+        maker_base_fee_bps=0,
+        taker_base_fee_bps=0,
+        taker_delay_enabled=False,
+        min_order_age_s=0.0,
+        fee_rate=0.0,
+        fee_exponent=1.0,
+    )
+    market = MarketContext(
+        market_id="t", condition_id="t", title="t", slug="t",
+        start_ts_ms=0, end_ts_ms=9_999_999_999_000,
+        yes_token_id="YES_TOKEN", no_token_id="NO_TOKEN",
+        clob=clob,
+    )
+    state = LocalState(
+        market=market,
+        yes_book=TokenBook(asset_id="YES_TOKEN"),
+        no_book=TokenBook(asset_id="NO_TOKEN"),
+    )
+    state.yes_book.bids = {0.50: 100.0}
+    state.yes_book.asks = {0.55: 100.0}
+    state.yes_book.best = BestBidAsk(bid=0.50, ask=0.55, spread=0.05)
+    state.yes_book.timestamp_ms = 1000
+    return state
+
+
+def _make_bare_session() -> LivePaperSession:
+    """Minimal LivePaperSession for direct method testing (no run_for)."""
+    from unittest.mock import MagicMock
+    return LivePaperSession(
+        discovery=MagicMock(),
+        market_provider=MagicMock(),
+        signal_provider=MagicMock(),
+        strategy=MagicMock(),
+    )
+
+
+def test_accrue_buy_fill_updates_position_state():
+    """BUY fill syncs state.position.qty and cost_basis."""
+    session = _make_bare_session()
+    state = _make_minimal_state()
+    session._accrue_buy_fill(state, fill_size=10.0, fill_price=0.50, now_ms=5000)
+    assert state.position.qty == 10.0
+    assert abs(state.position.cost_basis - 5.0) < 1e-10
+    assert session._position_qty == 10.0
+    assert abs(session._position_cost_basis - 5.0) < 1e-10
+
+
+def test_accrue_buy_fill_sets_opened_at_ms_on_first_fill_only():
+    """opened_at_ms is set on the first BUY fill and NOT overwritten by subsequent fills."""
+    session = _make_bare_session()
+    state = _make_minimal_state()
+    session._accrue_buy_fill(state, fill_size=5.0, fill_price=0.50, now_ms=1000)
+    assert state.position.opened_at_ms == 1000
+    session._accrue_buy_fill(state, fill_size=5.0, fill_price=0.50, now_ms=2000)
+    assert state.position.opened_at_ms == 1000  # not overwritten
+
+
+def test_accrue_buy_fill_updates_last_entry_fill_ts():
+    """last_entry_fill_ts_ms is updated on every BUY fill."""
+    session = _make_bare_session()
+    state = _make_minimal_state()
+    session._accrue_buy_fill(state, fill_size=5.0, fill_price=0.50, now_ms=1000)
+    assert state.position.last_entry_fill_ts_ms == 1000
+    session._accrue_buy_fill(state, fill_size=5.0, fill_price=0.50, now_ms=3000)
+    assert state.position.last_entry_fill_ts_ms == 3000
+
+
+def test_accrue_sell_fill_updates_position_state_and_realized_pnl():
+    """SELL fill syncs state.position and computes realized PnL correctly."""
+    session = _make_bare_session()
+    state = _make_minimal_state()
+    # First buy 10 at 0.50
+    session._accrue_buy_fill(state, fill_size=10.0, fill_price=0.50, now_ms=1000)
+    # Then sell 10 at 0.55 → realized_pnl = (0.55 - 0.50) * 10 = 0.50
+    session._accrue_sell_fill(state, fill_size=10.0, fill_price=0.55, now_ms=2000)
+    assert state.position.qty == 0.0
+    assert state.position.cost_basis == 0.0
+    assert abs(state.position.realized_pnl - 0.50) < 1e-9
+    assert state.position.last_exit_fill_ts_ms == 2000
+    assert abs(session._realized_pnl - 0.50) < 1e-9
+
+
+def test_accrue_sell_fill_partial_exit_reduces_qty_correctly():
+    """Partial SELL reduces position by exactly fill_size."""
+    session = _make_bare_session()
+    state = _make_minimal_state()
+    session._accrue_buy_fill(state, fill_size=10.0, fill_price=0.50, now_ms=1000)
+    session._accrue_sell_fill(state, fill_size=5.0, fill_price=0.55, now_ms=2000)
+    assert abs(state.position.qty - 5.0) < 1e-9
+    assert abs(state.position.cost_basis - 2.5) < 1e-9  # 0.50 * 5 remaining
+
+
+def test_accrue_sell_fill_noop_when_no_position():
+    """SELL with zero position is a safe no-op."""
+    session = _make_bare_session()
+    state = _make_minimal_state()
+    session._accrue_sell_fill(state, fill_size=5.0, fill_price=0.55, now_ms=1000)
+    assert state.position.qty == 0.0
+    assert session._realized_pnl == 0.0
+
+
+def test_decisions_in_flat_and_long_appear_in_summary():
+    """decisions_in_flat and decisions_in_long are present in LivePaperSummary."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [])
+    summary = asyncio.run(session.run_for(duration=5))
+    # Field exists and is non-negative integer
+    assert isinstance(summary.decisions_in_flat, int)
+    assert isinstance(summary.decisions_in_long, int)
+    assert summary.decisions_in_flat >= 0
+    assert summary.decisions_in_long >= 0
+
+
+def test_strategy_state_in_decision_event():
+    """Every decision event emitted by session has 'strategy_state' field."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    asyncio.run(session.run_for(duration=5))
+    decision_events = [e for e in session.events if e.get("event") == "decision"]
+    if decision_events:
+        for ev in decision_events:
+            assert "strategy_state" in ev
+            assert ev["strategy_state"] in ("flat", "long")
+
+
+def test_entry_edge_in_decision_event():
+    """Decision events include 'entry_edge' field (may be None for non-entry decisions)."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    asyncio.run(session.run_for(duration=5))
+    decision_events = [e for e in session.events if e.get("event") == "decision"]
+    if decision_events:
+        for ev in decision_events:
+            assert "entry_edge" in ev
