@@ -1,15 +1,14 @@
 """
-BTC M5 strategy tests — 16 groups matching the spec.
+BTC M5 strategy tests — 26 tests across 5 groups.
 
-Tests 1-3   : PTB fetching (SSR, API, Chainlink fallback)
-Tests 4-6   : EARLY consensus
-Tests 7-8   : baseline direction
-Tests 9-10  : hedge trigger
-Test  11    : no second hedge
-Test  12    : hedge blocked by cutoff
-Test  13    : price_insane guard
-Tests 14-15 : settlement P&L
-Test  16    : aggregate summary
+Tests 1-4   : PTB fetching (SSR, API, Chainlink fallback, stale rejection)
+Tests 5-7   : EARLY consensus
+Tests 8-10  : baseline direction
+Tests 11-14 : hedge trigger + no-second-hedge + cutoff block
+Tests 15-16 : price_insane guard
+Tests 17-19 : settlement P&L
+Test  20    : aggregate summary
+Tests 21-24 : integration (BtcHistory, Chainlink vote, separate traces, settlement)
 """
 from __future__ import annotations
 
