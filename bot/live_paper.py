@@ -709,8 +709,10 @@ class LivePaperSession:
                 "p_up": round(fair.p_up, 6),
                 "bid_price": desired.bid.price,
                 "bid_enabled": desired.bid.enabled,
+                "bid_reason": desired.bid.reason,
                 "ask_price": desired.ask.price,
                 "ask_enabled": desired.ask.enabled,
+                "ask_reason": desired.ask.reason,
                 "ptb_locked": ptb.locked,
                 "ptb_value": ptb.ptb_value,
                 # Attribution

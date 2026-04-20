@@ -20,8 +20,10 @@ Artifact layout (inside CampaignConfig.output_dir):
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -43,6 +45,14 @@ class CampaignConfig:
     #   (1000, 5000) → "<1000" / "1000-5000" / ">5000"
     gap_thresholds_usd: tuple = (50.0, 200.0)
     chainlink_age_thresholds_ms: tuple = (1000, 5000)
+    # M15 window boundary handling.
+    # If a session ends more than window_early_threshold_s before its requested
+    # duration (i.e., it was clamped to the window boundary), the runner waits
+    # until window_boundary_buffer_s past the next window start before launching
+    # the next session.  This absorbs the ~30 s market-publication lag on Polymarket.
+    window_size_s: int = 900
+    window_boundary_buffer_s: int = 35
+    window_early_threshold_s: int = 10
 
 
 class CampaignRunner:
@@ -64,8 +74,10 @@ class CampaignRunner:
 
         for i in range(cfg.session_count):
             session = session_factory()
+            t0 = _time.monotonic()
             # Exception here propagates; partial artifacts remain on disk.
             summary = await session.run_for(cfg.session_duration_s)
+            elapsed_s = _time.monotonic() - t0
 
             jsonl_name = f"session_{i:03d}.jsonl"
             summary_name = f"session_{i:03d}_summary.json"
@@ -76,6 +88,22 @@ class CampaignRunner:
             written_files.extend([jsonl_name, summary_name])
             session_summaries.append(summary)
             all_events.extend(session.events)
+
+            # If the session ended significantly early (clamped to the M15 window
+            # boundary), wait until window_boundary_buffer_s past the new window
+            # start so that the next discovery call finds a published market.
+            shortfall_s = cfg.session_duration_s - elapsed_s
+            if shortfall_s > cfg.window_early_threshold_s and i < cfg.session_count - 1:
+                now_real = _time.time()
+                time_since_boundary = now_real % cfg.window_size_s
+                wait_s = max(0.0, cfg.window_boundary_buffer_s - time_since_boundary)
+                if wait_s > 1.0:
+                    print(
+                        f"[campaign] session {i:03d} ended {shortfall_s:.0f}s early "
+                        f"(window boundary) — waiting {wait_s:.0f}s for next M15 market",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait_s)
 
         ended_at_ms = utc_now_ms()
 

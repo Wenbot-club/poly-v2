@@ -95,6 +95,12 @@ def _print_campaign_summary(cs: CampaignSummary) -> None:
     for trigger, stats in cs.by_trigger.items():
         print(f"  {trigger:>6}: decisions={stats.decision_count}")
 
+    print("\n  [gate reason breakdown  bid_reason per decision]")
+    total_decisions = sum(cs.by_bid_reason.values())
+    for reason, count in sorted(cs.by_bid_reason.items(), key=lambda kv: -kv[1]):
+        pct = 100.0 * count / total_decisions if total_decisions else 0.0
+        print(f"  {reason:>20}: {count:>5}  ({pct:.1f}%)")
+
     print(f"\n{sep}")
 
 
