@@ -14,9 +14,25 @@ from typing import Optional
 class TradeRecord:
     window_ts: int
 
-    # PTB
+    # Window audit
+    window_start_utc_iso: Optional[str] = None
+    window_end_utc_iso: Optional[str] = None
+    window_start_local_iso: Optional[str] = None
+    window_end_local_iso: Optional[str] = None
+    event_slug: Optional[str] = None
+
+    # PTB (selected value used for trading)
     ptb: Optional[float] = None
     ptb_source: Optional[str] = None           # "ssr" | "api" | "chainlink"
+
+    # PTB audit (raw values from each source)
+    ptb_ssr: Optional[float] = None
+    ptb_api: Optional[float] = None
+    ptb_chainlink: Optional[float] = None
+    ptb_selected: Optional[float] = None       # mirrors ptb for audit clarity
+    ptb_selected_source: Optional[str] = None  # mirrors ptb_source for audit clarity
+    ptb_ssr_api_delta_usd: Optional[float] = None
+    ptb_selected_api_delta_usd: Optional[float] = None
 
     # LEG1
     entry_mode: Optional[str] = None           # "early" | "baseline"
@@ -67,6 +83,10 @@ class TradeRecord:
     resolution_source: Optional[str] = None    # "api" | None
     resolution_latency_s: Optional[float] = None
     used_prefetched_tokens: bool = False
+
+    # Resolution audit (raw API values)
+    resolution_open_price_api: Optional[float] = None
+    resolution_close_price_api: Optional[float] = None
 
     # Abort / block
     abort_reason: Optional[str] = None         # "ptb_unavailable" | "tokens_unavailable" | ...
