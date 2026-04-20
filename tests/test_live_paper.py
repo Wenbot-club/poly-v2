@@ -1673,3 +1673,136 @@ def test_entry_edge_in_decision_event():
     if decision_events:
         for ev in decision_events:
             assert "entry_edge" in ev
+
+
+# ---------------------------------------------------------------------------
+# PR #14 — intent/strategy_reason on order events + round-trip tracking
+# ---------------------------------------------------------------------------
+
+def test_order_posted_bid_has_intent_entry():
+    """BID order_posted events have intent='entry'."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, ask_price=0.52)]
+    session = _make_session(msgs, [], initial_pusd=1000.0)
+    asyncio.run(session.run_for(duration=5))
+    posted = [e for e in session.events if e.get("event") == "order_posted" and e.get("side") == "BUY"]
+    if posted:
+        for ev in posted:
+            assert ev.get("intent") == "entry"
+            assert "strategy_reason" in ev
+
+
+def test_order_posted_ask_has_intent_exit():
+    """ASK order_posted events have intent='exit'."""
+    msgs = [_book_msg("YES_TOKEN", ts=100, bid_price=0.46, ask_price=0.52)]
+    strategy = FakeStrategy(_make_desired_quotes(bid_enabled=False, ask_enabled=True))
+    session = _make_session(
+        msgs, [], strategy=strategy, initial_up=20.0, initial_position_cost_basis=10.0
+    )
+    asyncio.run(session.run_for(duration=5))
+    posted = [e for e in session.events if e.get("event") == "order_posted" and e.get("side") == "SELL"]
+    if posted:
+        for ev in posted:
+            assert ev.get("intent") == "exit"
+            assert "strategy_reason" in ev
+
+
+def test_order_cancelled_has_intent_field():
+    """order_cancelled events have an 'intent' field ('entry' or 'exit')."""
+
+    class _FakeStrategyRepriceBid2:
+        def build(self, state: LocalState, fair: FairValueSnapshot, now_ms: int) -> DesiredQuotes:
+            price = 0.47 if state.yes_book.timestamp_ms > 100 else 0.48
+            return DesiredQuotes(
+                bid=DesiredOrder(enabled=True, side="BUY", price=price, size=10.0, reason="test"),
+                ask=DesiredOrder(enabled=False, side="SELL", price=0.55, size=10.0, reason="test"),
+                mode="passive",
+                inventory_skew=0.0,
+                timestamp_ms=state.yes_book.timestamp_ms,
+            )
+
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.52),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=_FakeStrategyRepriceBid2(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    asyncio.run(session.run_for(duration=5))
+    cancel_events = [e for e in session.events if e.get("event") == "order_cancelled"]
+    if cancel_events:
+        for ev in cancel_events:
+            assert "intent" in ev
+            assert ev["intent"] in ("entry", "exit")
+
+
+def test_fill_simulated_buy_has_intent_entry():
+    """BUY fill_simulated events have intent='entry'."""
+    msgs = [
+        _book_msg("YES_TOKEN", ts=100, ask_price=0.52),
+        _book_msg("YES_TOKEN", ts=200, ask_price=0.45),
+    ]
+    session = LivePaperSession(
+        discovery=FakeDiscoveryProvider(),
+        market_provider=FakeMarketDataProviderWithSleep(msgs),
+        signal_provider=FakeSignalProvider([]),
+        strategy=FakeStrategy(),
+        fair_engine=FakeFairValueEngine(),
+        config=DEFAULT_CONFIG,
+        initial_pusd=1000.0,
+        decision_poll_ms=0,
+    )
+    asyncio.run(session.run_for(duration=5))
+    buy_fills = [e for e in session.events if e.get("event") == "fill_simulated" and e.get("side") == "BUY"]
+    if buy_fills:
+        for ev in buy_fills:
+            assert ev.get("intent") == "entry"
+            assert "strategy_reason" in ev
+
+
+def test_fill_simulated_sell_has_intent_exit():
+    """SELL fill_simulated events have intent='exit'."""
+    summary = asyncio.run(_round_trip_session().run_for(duration=5))
+    # Check via _round_trip_session which uses FakeInventoryAwareStrategy
+    session2 = _round_trip_session()
+    asyncio.run(session2.run_for(duration=5))
+    sell_fills = [e for e in session2.events if e.get("event") == "fill_simulated" and e.get("side") == "SELL"]
+    if sell_fills:
+        for ev in sell_fills:
+            assert ev.get("intent") == "exit"
+            assert "strategy_reason" in ev
+
+
+def test_completed_round_trips_zero_when_no_fills():
+    """completed_round_trips is 0 when there are no fills at all."""
+    session = _make_session([], [])
+    summary = asyncio.run(session.run_for(duration=5))
+    assert summary.completed_round_trips == 0
+    assert summary.forced_exit_count == 0
+    assert summary.avg_holding_time_s is None
+    assert summary.max_holding_time_s is None
+    assert summary.last_exit_reason is None
+
+
+def test_completed_round_trips_incremented_after_full_sell():
+    """A full buy-then-sell increments completed_round_trips by 1."""
+    session = _round_trip_session()
+    summary = asyncio.run(session.run_for(duration=5))
+    if summary.bid_fills_simulated >= 1 and summary.ask_fills_simulated >= 1 and summary.final_up_free == 0.0:
+        assert summary.completed_round_trips == 1
+
+
+def test_last_exit_reason_set_after_sell_fill():
+    """last_exit_reason matches strategy_reason of the SELL fill event."""
+    session = _round_trip_session()
+    asyncio.run(session.run_for(duration=5))
+    sell_fills = [e for e in session.events if e.get("event") == "fill_simulated" and e.get("side") == "SELL"]
+    if sell_fills:
+        last_sell_reason = sell_fills[-1].get("strategy_reason")
+        assert session._last_exit_reason == last_sell_reason

@@ -200,7 +200,7 @@ def test_flat_passive_entry_bids_just_below_ask():
     ))
     result = policy.build(state, fair, NOW_MS)
     assert result.bid.enabled
-    assert result.bid.reason == "enter_passive"
+    assert result.bid.reason == "enter_long_passive"
     assert result.bid.price is not None
     assert result.bid.price < 0.55  # bid below ask
     assert result.strategy_state == "flat"
@@ -221,7 +221,7 @@ def test_flat_aggressive_entry_bids_at_ask():
     ))
     result = policy.build(state, fair, NOW_MS)
     assert result.bid.enabled
-    assert result.bid.reason == "enter_aggressive"
+    assert result.bid.reason == "enter_long_aggressive"
     assert result.bid.price == 0.55  # bid at ask (lift the ask)
     assert result.strategy_state == "flat"
 
@@ -245,8 +245,8 @@ def test_tau_gate_blocks_entry_when_tau_too_small():
 # ---------------------------------------------------------------------------
 
 def test_long_hold_when_no_exit_trigger():
-    # avg_cost=0.50, fair.p_up=0.52 → pnl=0.02 (< take_profit=0.04, > stop_loss=-0.03)
-    # fair.p_up=0.52 > avg_cost+edge_lost=0.51 → no edge_lost
+    # pnl = best_bid - avg_cost = 0.50 - 0.50 = 0.0 (< take_profit=0.04, > stop_loss=-0.03)
+    # unrealized_edge = fair.p_up - best_bid = 0.52 - 0.50 = 0.02 >= edge_lost=0.01 → no edge_lost
     state = _make_state(
         yes_bid=0.50, yes_ask=0.56,
         position_qty=10.0, position_cost=5.0,  # avg_cost=0.50
@@ -262,7 +262,7 @@ def test_long_hold_when_no_exit_trigger():
     assert result.ask.reason == "hold"
     assert result.strategy_state == "long"
     assert result.pnl_per_share is not None
-    assert abs(result.pnl_per_share - 0.02) < 1e-6
+    assert abs(result.pnl_per_share - 0.0) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def test_long_hold_when_no_exit_trigger():
 # ---------------------------------------------------------------------------
 
 def test_long_stop_loss_triggers_aggressive_exit():
-    # avg_cost=0.60, fair.p_up=0.55 → pnl=-0.05 < stop_loss=-0.03
+    # pnl = best_bid - avg_cost = 0.54 - 0.60 = -0.06 < stop_loss=-0.03
     state = _make_state(
         yes_bid=0.54, yes_ask=0.62,
         up_free=10.0,
@@ -291,7 +291,8 @@ def test_long_stop_loss_triggers_aggressive_exit():
 # ---------------------------------------------------------------------------
 
 def test_long_take_profit_triggers_passive_exit():
-    # avg_cost=0.50, fair.p_up=0.56 → pnl=0.06 >= take_profit=0.04
+    # pnl = best_bid - avg_cost = 0.54 - 0.50 = 0.04 >= take_profit=0.04
+    # tau=900 >> aggressive_exit_tau_s=60 → passive exit
     state = _make_state(
         yes_bid=0.54, yes_ask=0.62,
         up_free=10.0,
@@ -301,7 +302,7 @@ def test_long_take_profit_triggers_passive_exit():
     policy = DirectionalPolicyV2(config=_make_config(take_profit_prob=0.04))
     result = policy.build(state, fair, NOW_MS)
     assert result.ask.enabled
-    assert result.ask.reason == "exit_take_profit"
+    assert result.ask.reason == "exit_take_profit_passive"
     assert result.ask.price == 0.55  # passive: top_bid + tick = 0.54 + 0.01
     assert result.strategy_state == "long"
 
@@ -310,23 +311,25 @@ def test_long_take_profit_triggers_passive_exit():
 # Test 9: LONG — edge lost triggers aggressive exit
 # ---------------------------------------------------------------------------
 
-def test_long_edge_lost_triggers_aggressive_exit():
-    # avg_cost=0.55, fair.p_up=0.55 → fair.p_up < avg_cost + edge_lost(0.01)=0.56 → edge lost
+def test_long_edge_lost_triggers_passive_exit():
+    # unrealized_edge = fair.p_up - best_bid = 0.55 - 0.54 = 0.01 < edge_lost_exit_prob=0.02
+    # pnl = best_bid - avg_cost = 0.54 - 0.55 = -0.01 > stop_loss=-0.03 → no stop_loss
+    # tau=900 >> aggressive_exit_tau_s=60 → passive exit
     state = _make_state(
-        yes_bid=0.52, yes_ask=0.60,
+        yes_bid=0.54, yes_ask=0.62,
         up_free=10.0,
         position_qty=10.0, position_cost=5.5,  # avg_cost=0.55
     )
     fair = _make_fair(p_up=0.55, tau_s=900.0)
     policy = DirectionalPolicyV2(config=_make_config(
-        stop_loss_prob=-0.03,  # pnl=0.0 > -0.03, so not stop loss
-        edge_lost_exit_prob=0.01,
+        stop_loss_prob=-0.03,
+        edge_lost_exit_prob=0.02,
         take_profit_prob=0.04,
     ))
     result = policy.build(state, fair, NOW_MS)
     assert result.ask.enabled
-    assert result.ask.reason == "exit_edge_lost"
-    assert result.ask.price == 0.52  # aggressive: at top_bid
+    assert result.ask.reason == "exit_edge_lost_passive"
+    assert result.ask.price == 0.55  # passive: top_bid + tick = 0.54 + 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +346,7 @@ def test_force_exit_when_tau_below_threshold():
     policy = DirectionalPolicyV2(config=_make_config(force_exit_tau_s=45.0))
     result = policy.build(state, fair, NOW_MS)
     assert result.ask.enabled
-    assert result.ask.reason == "force_exit"
+    assert result.ask.reason == "exit_force"
     assert result.ask.price == 0.50  # aggressive: at top_bid
 
 
@@ -366,7 +369,7 @@ def test_force_exit_bypasses_freshness_gates():
     ))
     result = policy.build(state, fair, NOW_MS)
     assert result.ask.enabled
-    assert result.ask.reason == "force_exit"  # not "binance_stale"
+    assert result.ask.reason == "exit_force"  # not "binance_stale"
 
 
 # ---------------------------------------------------------------------------
@@ -452,3 +455,154 @@ def test_bid_always_disabled_in_long_state():
     assert result.strategy_state == "long"
     assert not result.bid.enabled
     assert result.bid.reason == "no_pyramid"
+
+
+# ---------------------------------------------------------------------------
+# Test 16: sizing — max_position_notional_usd cap
+# ---------------------------------------------------------------------------
+
+def test_entry_size_capped_by_max_position_notional():
+    # entry_notional=50 at price 0.55 → raw size=90.9; max_notional=25 → max_size=45.4
+    # bid_size = min(90.9, 45.4) = 45.4 — enabled
+    state = _make_state(yes_ask=0.55, yes_bid=0.45, pusd_free=1000.0)
+    fair = _make_fair(p_up=0.62, tau_s=900.0)
+    from bot.settings import (
+        ConfigValue, DirectionalThresholds, FreshnessThresholds,
+        InventoryThresholds, PTBThresholds, QuoteThresholds, Thresholds,
+    )
+    cfg = RuntimeConfig(
+        thresholds=Thresholds(
+            directional=DirectionalThresholds(
+                min_entry_edge_prob=0.02,
+                aggressive_entry_edge_prob=0.05,
+                entry_notional_usd=50.0,
+                max_position_notional_usd=25.0,
+            ),
+        )
+    )
+    policy = DirectionalPolicyV2(config=cfg)
+    result = policy.build(state, fair, NOW_MS)
+    assert result.bid.enabled
+    # max_size = floor(25 / 0.55 * 1000) / 1000 = floor(45454.5) / 1000 = 45.454
+    assert result.bid.size <= 25.0 / 0.55 + 0.001
+
+
+def test_entry_refused_when_size_below_min_order():
+    # entry_notional=1 at price 0.55 → size≈1.818; min_order_size=5 → refused
+    state = _make_state(yes_ask=0.55, yes_bid=0.45, pusd_free=1000.0)
+    fair = _make_fair(p_up=0.62, tau_s=900.0)
+    cfg = _make_config(entry_notional_usd=1.0)
+    policy = DirectionalPolicyV2(config=cfg)
+    result = policy.build(state, fair, NOW_MS)
+    # min_order_size=1.0 from _make_clob default; 1/0.55≈1.818 >= 1.0 → enabled
+    # Use a real min_order_size=5.0 via custom clob
+    from bot.domain import BestBidAsk, ClobMarketInfo, ClobToken, TokenBook
+    state2 = _make_state(yes_ask=0.55, yes_bid=0.45, pusd_free=1000.0)
+    state2.market = _make_market()
+    state2.market = MarketContext(
+        market_id="test",
+        condition_id="test",
+        title="Test",
+        slug="test",
+        start_ts_ms=0,
+        end_ts_ms=9_999_999_999_000,
+        yes_token_id="YES",
+        no_token_id="NO",
+        clob=ClobMarketInfo(
+            tokens=[ClobToken(token_id="YES", outcome="Yes")],
+            min_order_size=10.0,  # large min_order_size
+            min_tick_size=0.01,
+            maker_base_fee_bps=0,
+            taker_base_fee_bps=0,
+            taker_delay_enabled=False,
+            min_order_age_s=0.0,
+            fee_rate=0.0,
+            fee_exponent=1.0,
+        ),
+    )
+    # entry_notional=1 at 0.55 → size≈1.818 < min_order=10 → refused
+    result2 = policy.build(state2, fair, NOW_MS)
+    assert not result2.bid.enabled
+    assert result2.bid.reason == "size_too_small"
+
+
+# ---------------------------------------------------------------------------
+# Test 17: pnl_per_share uses best_bid not fair.p_up
+# ---------------------------------------------------------------------------
+
+def test_pnl_per_share_uses_best_bid_not_fair():
+    # avg_cost=0.50, best_bid=0.52, fair.p_up=0.60
+    # pnl = 0.52 - 0.50 = 0.02 (not 0.10)
+    state = _make_state(
+        yes_bid=0.52, yes_ask=0.62,
+        up_free=10.0,
+        position_qty=10.0, position_cost=5.0,  # avg_cost=0.50
+    )
+    fair = _make_fair(p_up=0.60, tau_s=900.0)
+    policy = DirectionalPolicyV2(config=_make_config(
+        take_profit_prob=0.10,  # high enough to not trigger at 0.02
+        stop_loss_prob=-0.03,
+        edge_lost_exit_prob=0.01,
+    ))
+    result = policy.build(state, fair, NOW_MS)
+    assert result.pnl_per_share is not None
+    assert abs(result.pnl_per_share - 0.02) < 1e-6  # best_bid - avg_cost
+
+
+# ---------------------------------------------------------------------------
+# Test 18: take_profit aggressive when tau <= aggressive_exit_tau_s
+# ---------------------------------------------------------------------------
+
+def test_take_profit_aggressive_when_tau_low():
+    # pnl = 0.54 - 0.50 = 0.04 >= take_profit=0.04
+    # tau=50 <= aggressive_exit_tau_s=60 → aggressive exit
+    state = _make_state(
+        yes_bid=0.54, yes_ask=0.62,
+        up_free=10.0,
+        position_qty=10.0, position_cost=5.0,  # avg_cost=0.50
+    )
+    fair = _make_fair(p_up=0.60, tau_s=50.0)  # 50 <= 60 → aggressive
+    policy = DirectionalPolicyV2(config=_make_config(
+        take_profit_prob=0.04, force_exit_tau_s=45.0
+    ))
+    result = policy.build(state, fair, NOW_MS)
+    assert result.ask.enabled
+    assert result.ask.reason == "exit_take_profit_aggressive"
+    assert result.ask.price == 0.54  # aggressive: at top_bid
+
+
+# ---------------------------------------------------------------------------
+# Test 19: edge_lost aggressive when tau <= aggressive_exit_tau_s
+# ---------------------------------------------------------------------------
+
+def test_edge_lost_aggressive_when_tau_low():
+    # unrealized_edge = 0.55 - 0.54 = 0.01 < edge_lost_exit_prob=0.02
+    # tau=50 <= aggressive_exit_tau_s=60 → aggressive
+    state = _make_state(
+        yes_bid=0.54, yes_ask=0.62,
+        up_free=10.0,
+        position_qty=10.0, position_cost=5.5,  # avg_cost=0.55
+    )
+    fair = _make_fair(p_up=0.55, tau_s=50.0)
+    policy = DirectionalPolicyV2(config=_make_config(
+        stop_loss_prob=-0.03,
+        edge_lost_exit_prob=0.02,
+        take_profit_prob=0.04,
+        force_exit_tau_s=45.0,
+    ))
+    result = policy.build(state, fair, NOW_MS)
+    assert result.ask.enabled
+    assert result.ask.reason == "exit_edge_lost_aggressive"
+    assert result.ask.price == 0.54  # aggressive: at top_bid
+
+
+# ---------------------------------------------------------------------------
+# Test 20: desired_quotes set on state after build()
+# ---------------------------------------------------------------------------
+
+def test_desired_quotes_set_on_state_after_build():
+    state = _make_state(yes_ask=0.55, yes_bid=0.45)
+    fair = _make_fair(p_up=0.62, tau_s=900.0)
+    policy = DirectionalPolicyV2(config=_make_config(min_entry_edge_prob=0.02))
+    result = policy.build(state, fair, NOW_MS)
+    assert state.desired_quotes is result
