@@ -26,33 +26,47 @@ from pathlib import Path
 
 import aiohttp
 
-from bot.m5_session import M5Session, M5SignalState, fetch_token_best_ask
+from bot.m5_session import M5Session, M5SignalState, BtcHistory, fetch_token_best_ask
 from bot.m5_summary import TradeRecord, aggregate_trades
+from bot.providers.binance_signal import BinanceSignalProvider
+from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.settings import DEFAULT_M5_CONFIG, M5Config
 
-_BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
 _POLY_BASE = "https://polymarket.com"
 
 
-async def _update_btc_loop(
+async def _update_binance_loop(
+    http: aiohttp.ClientSession,
+    state: M5SignalState,
+    btc_history: BtcHistory,
+) -> None:
+    """Background task: stream Binance BTC/USDT aggTrade and record into history."""
+    provider = BinanceSignalProvider(session=http)
+    await provider.connect("btc/usd")
+    try:
+        async for tick in provider.iter_signals():
+            price = tick["value"]
+            ts_ms = tick["recv_timestamp_ms"]
+            state.btc_price = price
+            state.btc_price_ts_ms = ts_ms
+            btc_history.record(price, ts_ms)
+    finally:
+        await provider.close()
+
+
+async def _update_chainlink_loop(
     http: aiohttp.ClientSession,
     state: M5SignalState,
 ) -> None:
-    """Background task: poll Binance BTC/USDT price every second."""
-    while True:
-        try:
-            async with http.get(
-                _BINANCE_PRICE_URL,
-                params={"symbol": "BTCUSDT"},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    state.btc_price = float(data["price"])
-                    state.btc_price_ts_ms = int(_time.time() * 1000)
-        except Exception:
-            pass
-        await asyncio.sleep(1.0)
+    """Background task: stream Polymarket Chainlink BTC/USD feed."""
+    provider = PolymarketChainlinkSignalProvider(session=http)
+    await provider.connect("btc/usd")
+    try:
+        async for tick in provider.iter_signals():
+            state.chainlink_price = tick["value"]
+            state.chainlink_price_ts_ms = tick["recv_timestamp_ms"]
+    finally:
+        await provider.close()
 
 
 def _next_m5_window_ts(cfg: M5Config, min_remaining_s: float) -> int:
@@ -77,9 +91,17 @@ def _print_record(record: TradeRecord) -> None:
     if record.entry_mode == "early":
         print(f"  consensus: score={record.entry_consensus_score:.1f}"
               f"  non_neutral={record.entry_consensus_non_neutral}")
+    if record.leg1_slippage is not None:
+        print(f"  leg1_trace: ask={record.leg1_observed_ask:.4f}"
+              f"  attempted={record.leg1_attempted_price:.4f}"
+              f"  slippage={record.leg1_slippage:.4f}")
     if record.hedged:
         print(f"  hedge  : side={record.hedge_side}  t={record.hedge_elapsed_s:.1f}s"
               f"  price={record.hedge_price:.4f}  btc_at_trigger={record.hedge_trigger_btc:.2f}")
+        if record.hedge_slippage is not None:
+            print(f"  hedge_trace: ask={record.hedge_observed_ask:.4f}"
+                  f"  attempted={record.hedge_attempted_price:.4f}"
+                  f"  slippage={record.hedge_slippage:.4f}")
     if record.hedge_blocked_by_cutoff:
         print("  hedge  : blocked by cutoff")
     if record.price_insane_block_count:
@@ -95,10 +117,15 @@ async def run_campaign(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     state = M5SignalState()
+    btc_history = BtcHistory()
     trades: list[TradeRecord] = []
 
     async with aiohttp.ClientSession() as http:
-        btc_task = asyncio.create_task(_update_btc_loop(http, state))
+        binance_task = asyncio.create_task(_update_binance_loop(http, state, btc_history))
+        chainlink_task = asyncio.create_task(_update_chainlink_loop(http, state))
+
+        # Give feeds a moment to establish before first window
+        await asyncio.sleep(2.0)
 
         try:
             for i in range(window_count):
@@ -113,13 +140,15 @@ async def run_campaign(
                     await asyncio.sleep(wait_s)
 
                 print(f"\n[m5] starting window {i+1}/{window_count}  ts={wts}"
-                      f"  btc_now={state.btc_price}")
+                      f"  btc_now={state.btc_price}"
+                      f"  chainlink={state.chainlink_price}")
 
                 session = M5Session(
                     http_session=http,
                     signal_state=state,
                     config=cfg,
                     time_fn=_time.time,
+                    btc_history=btc_history,
                 )
                 record = await session.run(wts)
                 trades.append(record)
@@ -138,11 +167,13 @@ async def run_campaign(
                     await asyncio.sleep(max(0.0, time_to_next_boundary + 5))
 
         finally:
-            btc_task.cancel()
-            try:
-                await btc_task
-            except asyncio.CancelledError:
-                pass
+            binance_task.cancel()
+            chainlink_task.cancel()
+            for task in (binance_task, chainlink_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     summary = aggregate_trades(trades)
     summary_path = output_dir / "m5_campaign_summary.json"
@@ -163,6 +194,8 @@ async def run_campaign(
     print(f"  net_pnl_total       : {summary.net_pnl_total}")
     print(f"  avg_leg1_price      : {summary.avg_leg1_entry_price}")
     print(f"  avg_hedge_price     : {summary.avg_hedge_entry_price}")
+    print(f"  avg_leg1_slippage   : {summary.avg_leg1_slippage}")
+    print(f"  avg_hedge_slippage  : {summary.avg_hedge_slippage}")
     print(f"\n[artifacts] {output_dir}/")
 
 

@@ -39,11 +39,17 @@ class TradeRecord:
     hedge_blocked_by_cutoff: bool = False
     price_insane_block_count: int = 0
 
-    # Paper execution trace (last attempt)
-    last_observed_ask: Optional[float] = None
-    last_attempted_price: Optional[float] = None
-    last_slippage: Optional[float] = None      # attempted - observed
-    last_fill_retries: int = 0
+    # Paper execution trace — LEG1 (separate from HEDGE)
+    leg1_observed_ask: Optional[float] = None
+    leg1_attempted_price: Optional[float] = None
+    leg1_slippage: Optional[float] = None      # attempted - observed
+    leg1_fill_retries: int = 0
+
+    # Paper execution trace — HEDGE
+    hedge_observed_ask: Optional[float] = None
+    hedge_attempted_price: Optional[float] = None
+    hedge_slippage: Optional[float] = None
+    hedge_fill_retries: int = 0
 
     # Settlement
     result: Optional[str] = None               # "up" | "down"
@@ -71,6 +77,8 @@ class M5CampaignSummary:
     net_pnl_total: float
     avg_leg1_entry_price: Optional[float]
     avg_hedge_entry_price: Optional[float]
+    avg_leg1_slippage: Optional[float]
+    avg_hedge_slippage: Optional[float]
     trades: list = field(default_factory=list)  # list[TradeRecord]
 
 
@@ -84,6 +92,8 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
 
     leg1_prices = [t.entry_price for t in entered if t.entry_price is not None]
     hedge_prices = [t.hedge_price for t in hedged if t.hedge_price is not None]
+    leg1_slippages = [t.leg1_slippage for t in entered if t.leg1_slippage is not None]
+    hedge_slippages = [t.hedge_slippage for t in hedged if t.hedge_slippage is not None]
 
     return M5CampaignSummary(
         windows_seen=len(trades),
@@ -103,6 +113,12 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
         ),
         avg_hedge_entry_price=(
             sum(hedge_prices) / len(hedge_prices) if hedge_prices else None
+        ),
+        avg_leg1_slippage=(
+            sum(leg1_slippages) / len(leg1_slippages) if leg1_slippages else None
+        ),
+        avg_hedge_slippage=(
+            sum(hedge_slippages) / len(hedge_slippages) if hedge_slippages else None
         ),
         trades=trades,
     )

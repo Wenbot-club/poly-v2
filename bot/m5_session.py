@@ -298,6 +298,7 @@ class M5Session:
         gamma_base_url: str = _GAMMA_BASE,
         clob_base_url: str = _CLOB_BASE,
         polymarket_base_url: str = _POLY_BASE,
+        btc_history: Optional[BtcHistory] = None,
     ) -> None:
         self._http = http_session
         self._signals = signal_state
@@ -308,7 +309,7 @@ class M5Session:
         self._poly_url = polymarket_base_url
 
         self._token_prices: dict = {}   # token_id → best_ask
-        self._btc_history = BtcHistory()
+        self._btc_history = btc_history if btc_history is not None else BtcHistory()
         self._price_insane_blocks: int = 0
         self._hedge_blocked_by_cutoff: bool = False
 
@@ -462,7 +463,7 @@ class M5Session:
             return False
 
         fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
-        self._apply_fill_trace(record, fill)
+        self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
             return False
 
@@ -504,7 +505,7 @@ class M5Session:
             return False
 
         fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
-        self._apply_fill_trace(record, fill)
+        self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
             return False
 
@@ -550,7 +551,7 @@ class M5Session:
                         fill = await self._execute_paper(
                             best_ask, cfg.hedge_bet_usd, is_leg1=False
                         )
-                        self._apply_fill_trace(record, fill)
+                        self._apply_fill_trace(record, fill, "hedge")
                         if fill.reject_reason is None:
                             record.hedged = True
                             record.hedge_elapsed_s = elapsed_s
@@ -633,8 +634,14 @@ class M5Session:
     def _elapsed(self, window_ts: int) -> float:
         return self._time_fn() - window_ts
 
-    def _apply_fill_trace(self, record: TradeRecord, fill: PaperFillResult) -> None:
-        record.last_observed_ask = fill.observed_best_ask
-        record.last_attempted_price = fill.attempted_price
-        record.last_slippage = fill.slippage
-        record.last_fill_retries = fill.retries
+    def _apply_fill_trace(self, record: TradeRecord, fill: PaperFillResult, role: str) -> None:
+        if role == "leg1":
+            record.leg1_observed_ask = fill.observed_best_ask
+            record.leg1_attempted_price = fill.attempted_price
+            record.leg1_slippage = fill.slippage
+            record.leg1_fill_retries = fill.retries
+        else:
+            record.hedge_observed_ask = fill.observed_best_ask
+            record.hedge_attempted_price = fill.attempted_price
+            record.hedge_slippage = fill.slippage
+            record.hedge_fill_retries = fill.retries

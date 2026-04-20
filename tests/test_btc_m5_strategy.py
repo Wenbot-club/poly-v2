@@ -29,6 +29,7 @@ from bot.m5_session import (
     fetch_ptb_ssr,
     fetch_ptb_api,
 )
+
 from bot.m5_summary import TradeRecord, aggregate_trades
 from bot.settings import M5Config
 from bot.strategy.btc_m5 import (
@@ -82,12 +83,14 @@ def _make_session(
     http=None,
     time_fn=None,
     token_prices: Optional[dict] = None,
+    btc_history=None,
 ) -> M5Session:
     s = M5Session(
         http_session=http or _make_http({}),
         signal_state=signal or M5SignalState(),
         config=cfg or M5Config(),
         time_fn=time_fn or (lambda: 0.0),
+        btc_history=btc_history,
     )
     if token_prices:
         s._token_prices = token_prices
@@ -424,3 +427,137 @@ def test_aggregate_summary_correct():
     assert summary.net_pnl_total == pytest.approx(-1.75 + 1.50)
     assert summary.avg_leg1_entry_price == pytest.approx((0.60 + 0.40) / 2)
     assert summary.avg_hedge_entry_price == pytest.approx(0.45)
+
+
+# ---------------------------------------------------------------------------
+# Integration tests
+# ---------------------------------------------------------------------------
+
+def test_early_entry_uses_injected_btc_history():
+    """BtcHistory momentum votes reach compute_consensus when history is injected."""
+    window_ts = 1_000_000
+    now_ms = int((window_ts + 145.0) * 1000)
+
+    history = BtcHistory()
+    history.record(84_800.0, now_ms - 65_000)   # ~65s ago
+    history.record(84_850.0, now_ms - 35_000)   # ~35s ago
+    history.record(84_900.0, now_ms - 12_000)   # ~12s ago
+
+    # BTC now above all history → momentum signals all +1; chainlink also above PTB
+    signal = M5SignalState(btc_price=85_100.0, chainlink_price=85_050.0)
+    session = _make_session(
+        signal=signal,
+        time_fn=lambda: window_ts + 145.0,
+        token_prices={"up": 0.65, "dn": 0.35},
+        btc_history=history,
+    )
+
+    record = TradeRecord(window_ts=window_ts)
+    entered = asyncio.run(session._try_early_entry(
+        record, ptb=85_000.0, up_id="up", down_id="dn", window_ts=window_ts,
+    ))
+
+    assert entered is True
+    assert record.entry_mode == "early"
+    assert record.entry_side == "up"
+    # All 8 signals aligned → score == 100 (>= threshold 88)
+    assert record.entry_consensus_score == pytest.approx(100.0)
+    assert record.entry_consensus_non_neutral == 8
+
+
+def test_chainlink_vote_counted_in_consensus():
+    """Removing chainlink reduces non_neutral count by exactly one vote."""
+    kwargs = dict(
+        btc=85_100.0, ptb=85_000.0,
+        btc_10s=84_900.0, btc_30s=84_800.0, btc_60s=84_700.0,
+        price_up=0.65,
+        threshold=88.0, min_non_neutral=3,
+    )
+    with_cl = compute_consensus(chainlink=85_050.0, **kwargs)
+    without_cl = compute_consensus(chainlink=None, **kwargs)
+
+    assert with_cl.non_neutral == without_cl.non_neutral + 1
+    assert with_cl.up_votes == without_cl.up_votes + 1
+
+
+def test_leg1_and_hedge_fill_traces_are_independent():
+    """_apply_fill_trace(role='leg1') and (role='hedge') write to separate fields."""
+    session = _make_session()
+    record = TradeRecord(window_ts=1_000_000)
+
+    leg1_fill = PaperFillResult(
+        fill_price=0.60, shares=round(1.0 / 0.60, 8),
+        observed_best_ask=0.60,
+        attempted_price=0.601,
+        slippage=0.001,
+        retries=0, reject_reason=None,
+    )
+    session._apply_fill_trace(record, leg1_fill, "leg1")
+
+    assert record.leg1_observed_ask == pytest.approx(0.60)
+    assert record.leg1_slippage == pytest.approx(0.001)
+    assert record.hedge_observed_ask is None   # not yet set
+
+    hedge_fill = PaperFillResult(
+        fill_price=0.45, shares=round(2.0 / 0.45, 8),
+        observed_best_ask=0.45,
+        attempted_price=0.451,
+        slippage=0.001,
+        retries=1, reject_reason=None,
+    )
+    session._apply_fill_trace(record, hedge_fill, "hedge")
+
+    assert record.hedge_observed_ask == pytest.approx(0.45)
+    assert record.hedge_fill_retries == 1
+    # LEG1 fields must be unchanged after hedge trace
+    assert record.leg1_observed_ask == pytest.approx(0.60)
+    assert record.leg1_fill_retries == 0
+
+
+def test_settlement_with_both_leg_traces_on_record():
+    """A record with both leg1_* and hedge_* traces settles correctly via compute_settlement."""
+    session = _make_session()
+    record = TradeRecord(window_ts=1_000_000)
+
+    # Simulate LEG1 fill (UP at 0.60)
+    leg1_fill = PaperFillResult(
+        fill_price=0.60, shares=round(1.0 / 0.60, 8),
+        observed_best_ask=0.60, attempted_price=0.601,
+        slippage=0.001, retries=0, reject_reason=None,
+    )
+    session._apply_fill_trace(record, leg1_fill, "leg1")
+    record.entry_side = "up"
+    record.entry_price = 0.60
+    record.entry_shares = leg1_fill.shares
+
+    # Simulate HEDGE fill (DOWN at 0.45)
+    hedge_fill = PaperFillResult(
+        fill_price=0.45, shares=round(2.0 / 0.45, 8),
+        observed_best_ask=0.45, attempted_price=0.451,
+        slippage=0.001, retries=0, reject_reason=None,
+    )
+    session._apply_fill_trace(record, hedge_fill, "hedge")
+    record.hedged = True
+    record.hedge_side = "down"
+    record.hedge_price = 0.45
+    record.hedge_shares = hedge_fill.shares
+
+    from bot.strategy.btc_m5 import compute_settlement
+    s = compute_settlement(
+        close_price=84_900.0, open_price=85_000.0,   # result = "down"
+        leg1_side=record.entry_side,
+        leg1_entry_price=record.entry_price,
+        leg1_shares=record.entry_shares,
+        leg1_usd_staked=1.00,
+        hedge_side=record.hedge_side,
+        hedge_entry_price=record.hedge_price,
+        hedge_shares=record.hedge_shares,
+        hedge_usd_staked=2.00,
+    )
+
+    assert s.result == "down"
+    assert s.pnl_leg1 == pytest.approx(-1.00)
+    assert s.pnl_hedge == pytest.approx((1.0 - 0.45) * hedge_fill.shares, rel=1e-6)
+    # Trace fields are preserved independently
+    assert record.leg1_observed_ask == pytest.approx(0.60)
+    assert record.hedge_observed_ask == pytest.approx(0.45)
