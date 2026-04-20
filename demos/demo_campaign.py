@@ -139,7 +139,10 @@ async def run_campaign(
                 PolymarketChainlinkSignalProvider(http_session),
             ])
             return LivePaperSession(
-                discovery=PolymarketDiscoveryProvider(http_session),
+                discovery=PolymarketDiscoveryProvider(
+                    http_session,
+                    min_remaining_s=session_duration,
+                ),
                 market_provider=PolymarketMarketDataProvider(http_session),
                 signal_provider=signal_provider,
                 strategy=DirectionalPolicyV2(config=DEFAULT_CONFIG),

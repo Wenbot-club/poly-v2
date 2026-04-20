@@ -213,14 +213,19 @@ class PolymarketDiscoveryProvider:
         session: aiohttp.ClientSession,
         base_url: str = GAMMA_BASE_URL,
         now_fn: Callable[[], int] = utc_now_ms,
+        min_remaining_s: int = 0,
     ) -> None:
         self._session = session
         self._base_url = base_url
         self._now_fn = now_fn
+        self._min_remaining_s = min_remaining_s
 
     async def find_active_btc_15m_market(self) -> MarketContext:
         """
         Look up the BTC M15 market for the current 900-second UTC window.
+
+        If the current window has less than min_remaining_s of tradeable time
+        left, advances to the next window instead.
 
         Retries up to LOOKUP_RETRIES times (with LOOKUP_RETRY_DELAY_S between
         attempts) to tolerate the ~30 s publication delay at window start.
@@ -232,6 +237,9 @@ class PolymarketDiscoveryProvider:
         """
         now_s = self._now_fn() / 1000.0
         window_ts = int(math.floor(now_s / _BTC_15M_WINDOW_S) * _BTC_15M_WINDOW_S)
+        remaining_s = (window_ts + _BTC_15M_WINDOW_S) - now_s
+        if self._min_remaining_s > 0 and remaining_s < self._min_remaining_s:
+            window_ts += _BTC_15M_WINDOW_S
         slug = f"{_BTC_15M_SLUG_PREFIX}{window_ts}"
 
         for attempt in range(LOOKUP_RETRIES):
