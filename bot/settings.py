@@ -107,8 +107,9 @@ class M5Config:
     # Token price background polling
     token_price_refresh_s: float = 2.0
     # Settlement
-    settlement_poll_s: float = 5.0
-    settlement_timeout_s: float = 60.0
+    settlement_initial_delay_s: float = 15.0
+    settlement_poll_s: float = 4.0
+    settlement_max_attempts: int = 20
 
 
 DEFAULT_M5_CONFIG = M5Config()

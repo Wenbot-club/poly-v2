@@ -244,25 +244,40 @@ async def fetch_close_price(
     window_ts: int,
     *,
     polymarket_base_url: str = _POLY_BASE,
-    timeout_s: float = 60.0,
-    poll_interval_s: float = 5.0,
-) -> Optional[float]:
-    """Poll for closePrice after window expiry."""
+    window_end_s: float,
+    settlement_initial_delay_s: float = 15.0,
+    settlement_poll_s: float = 4.0,
+    settlement_max_attempts: int = 20,
+    time_fn: Callable = _time.time,
+) -> tuple:  # (Optional[float], int, Optional[float]) = (price, attempts, latency_s)
+    """
+    Poll for closePrice after window_end_s + settlement_initial_delay_s.
+    Returns (price, attempt_count, latency_s_from_window_end).
+    latency_s is None if all attempts exhausted without a result.
+    """
     url = f"{polymarket_base_url}/api/crypto/crypto-price"
     params = {"symbol": "BTC", "eventStartTime": window_ts, "variant": "fiveminute"}
-    deadline = _time.monotonic() + timeout_s
-    while _time.monotonic() < deadline:
+
+    first_poll_time = window_end_s + settlement_initial_delay_s
+    now = time_fn()
+    if now < first_poll_time:
+        await asyncio.sleep(first_poll_time - now)
+
+    for attempt in range(1, settlement_max_attempts + 1):
         try:
             async with http.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     v = data.get("closePrice")
                     if v is not None:
-                        return float(v)
+                        latency_s = time_fn() - window_end_s
+                        return float(v), attempt, latency_s
         except Exception:
             pass
-        await asyncio.sleep(poll_interval_s)
-    return None
+        if attempt < settlement_max_attempts:
+            await asyncio.sleep(settlement_poll_s)
+
+    return None, settlement_max_attempts, None
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +318,7 @@ class M5Session:
         clob_base_url: str = _CLOB_BASE,
         polymarket_base_url: str = _POLY_BASE,
         btc_history: Optional[BtcHistory] = None,
+        prefetched_tokens: Optional[tuple] = None,
     ) -> None:
         self._http = http_session
         self._signals = signal_state
@@ -316,6 +332,8 @@ class M5Session:
         self._btc_history = btc_history if btc_history is not None else BtcHistory()
         self._price_insane_blocks: int = 0
         self._hedge_blocked_by_cutoff: bool = False
+        self._prefetched_tokens = prefetched_tokens
+        self.next_tokens_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -343,8 +361,12 @@ class M5Session:
         record.ptb = ptb
         record.ptb_source = ptb_source
 
-        # Phase 3: token discovery
-        tokens = await fetch_m5_tokens(self._http, window_ts, self._gamma_url)
+        # Phase 3: token discovery (use prefetch cache if available)
+        if self._prefetched_tokens is not None:
+            tokens = self._prefetched_tokens
+            record.used_prefetched_tokens = True
+        else:
+            tokens = await fetch_m5_tokens(self._http, window_ts, self._gamma_url)
         if tokens is None:
             record.abort_reason = "tokens_unavailable"
             return record
@@ -366,19 +388,27 @@ class M5Session:
         record.price_insane_block_count = self._price_insane_blocks
         record.hedge_blocked_by_cutoff = self._hedge_blocked_by_cutoff
 
-        # Phase 8: settlement
+        # Launch prefetch for next window (runs concurrently with settlement wait)
+        self.next_tokens_task = asyncio.create_task(
+            fetch_m5_tokens(self._http, window_ts + self._cfg.window_seconds, self._gamma_url)
+        )
+
+        # Phase 8: settlement — fetch_close_price handles the window_end wait internally
         window_end_s = window_ts + self._cfg.window_seconds
-        now = self._time_fn()
-        if now < window_end_s:
-            await asyncio.sleep(window_end_s - now)
 
         if record.entry_side is not None and record.entry_price is not None:
-            close_price = await fetch_close_price(
+            close_price, attempts, latency_s = await fetch_close_price(
                 self._http, window_ts,
                 polymarket_base_url=self._poly_url,
-                timeout_s=self._cfg.settlement_timeout_s,
-                poll_interval_s=self._cfg.settlement_poll_s,
+                window_end_s=window_end_s,
+                settlement_initial_delay_s=self._cfg.settlement_initial_delay_s,
+                settlement_poll_s=self._cfg.settlement_poll_s,
+                settlement_max_attempts=self._cfg.settlement_max_attempts,
+                time_fn=self._time_fn,
             )
+            record.resolution_attempts = attempts
+            record.resolution_source = "api" if close_price is not None else None
+            record.resolution_latency_s = latency_s
             if close_price is not None:
                 s = compute_settlement(
                     close_price=close_price,
@@ -396,6 +426,11 @@ class M5Session:
                 record.pnl_leg1 = s.pnl_leg1
                 record.pnl_hedge = s.pnl_hedge
                 record.net_pnl = s.net_pnl
+        else:
+            # No position — still wait for window end before returning
+            now = self._time_fn()
+            if now < window_end_s:
+                await asyncio.sleep(window_end_s - now)
 
         return record
 

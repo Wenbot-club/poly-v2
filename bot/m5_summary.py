@@ -62,6 +62,12 @@ class TradeRecord:
     pnl_hedge: Optional[float] = None
     net_pnl: Optional[float] = None
 
+    # Resolution observability
+    resolution_attempts: int = 0
+    resolution_source: Optional[str] = None    # "api" | None
+    resolution_latency_s: Optional[float] = None
+    used_prefetched_tokens: bool = False
+
     # Abort / block
     abort_reason: Optional[str] = None         # "ptb_unavailable" | "tokens_unavailable" | ...
     entry_block_reason: Optional[str] = None   # "noise_zone" | "edge_not_enough" | "probability_not_strong_enough" | ...
@@ -91,6 +97,9 @@ class M5CampaignSummary:
     blocked_by_noise_zone_count: int = 0
     blocked_by_edge_count: int = 0
     blocked_by_probability_count: int = 0
+    # Resolution / prefetch diagnostics
+    avg_resolution_latency_s: Optional[float] = None
+    prefetched_token_hits: int = 0
     trades: list = field(default_factory=list)  # list[TradeRecord]
 
 
@@ -110,6 +119,8 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
     early_entered = [t for t in entered if t.entry_mode == "early"]
     p_vals = [t.p_model_up_at_entry for t in early_entered if t.p_model_up_at_entry is not None]
     sigma_vals = [t.sigma_to_close_at_entry for t in early_entered if t.sigma_to_close_at_entry is not None]
+
+    res_latencies = [t.resolution_latency_s for t in trades if t.resolution_latency_s is not None]
 
     return M5CampaignSummary(
         windows_seen=len(trades),
@@ -151,5 +162,9 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
         blocked_by_probability_count=sum(
             1 for t in trades if t.entry_block_reason == "probability_not_strong_enough"
         ),
+        avg_resolution_latency_s=(
+            sum(res_latencies) / len(res_latencies) if res_latencies else None
+        ),
+        prefetched_token_hits=sum(1 for t in trades if t.used_prefetched_tokens),
         trades=trades,
     )

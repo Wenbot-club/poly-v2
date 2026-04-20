@@ -4,9 +4,14 @@ BTC M5 PTB consensus demo — runs N consecutive windows.
 For each M5 window (300s):
   1. Discovers PTB via SSR/API/Chainlink
   2. Discovers UP/DOWN tokens via Gamma slug btc-updown-5m-{window_ts}
+     (prefetched during the previous window's resolution wait when possible)
   3. Scans EARLY consensus [140-170s], falls back to baseline at 170s
   4. Arms hedge if BTCrossed PTB ± 1.0 (cutoff: 250s)
   5. Settles at expiry via closePrice API
+
+Scheduler: deterministic — first window aligns to the next clean 5-min boundary
+(or current if >80% of the window remains), then advances strictly by 300s.
+No window is ever skipped because resolution ran late.
 
 Writes per-window summaries to <output_dir>/window_NNN.json
 and a campaign summary to <output_dir>/m5_campaign_summary.json
@@ -23,6 +28,7 @@ import json
 import math
 import time as _time
 from pathlib import Path
+from typing import Optional
 
 import aiohttp
 
@@ -69,12 +75,12 @@ async def _update_chainlink_loop(
         await provider.close()
 
 
-def _next_m5_window_ts(cfg: M5Config, min_remaining_s: float) -> int:
-    """Return window_ts with at least min_remaining_s of life left."""
-    now = _time.time()
+def _first_m5_window_ts(cfg: M5Config, time_fn=_time.time) -> int:
+    """First window: current boundary if >80% remains, else next."""
+    now = time_fn()
     ws = cfg.window_seconds
     wts = int(math.floor(now / ws) * ws)
-    if (wts + ws) - now < min_remaining_s:
+    if (wts + ws) - now < ws * 0.8:
         wts += ws
     return wts
 
@@ -108,6 +114,11 @@ def _print_record(record: TradeRecord) -> None:
         print("  hedge  : blocked by cutoff")
     if record.price_insane_block_count:
         print(f"  price_insane blocks: {record.price_insane_block_count}")
+    if record.resolution_latency_s is not None:
+        print(f"  resolution: attempts={record.resolution_attempts}"
+              f"  latency={record.resolution_latency_s:.1f}s")
+    else:
+        print(f"  resolution: attempts={record.resolution_attempts}  latency=n/a")
     print(f"  result : {record.result}  pnl_leg1={record.pnl_leg1}  "
           f"pnl_hedge={record.pnl_hedge}  net={record.net_pnl}")
 
@@ -129,10 +140,13 @@ async def run_campaign(
         # Give feeds a moment to establish before first window
         await asyncio.sleep(2.0)
 
+        # Deterministic scheduler — first boundary alignment, then strict +300s
+        wts = _first_m5_window_ts(cfg)
+        next_tokens_cache_window_ts: Optional[int] = None
+        next_tokens_cache_task: Optional[asyncio.Task] = None
+
         try:
             for i in range(window_count):
-                wts = _next_m5_window_ts(cfg, min_remaining_s=cfg.window_seconds * 0.8)
-                window_end = wts + cfg.window_seconds
                 now = _time.time()
                 wait_s = max(0.0, wts - now)
 
@@ -141,9 +155,22 @@ async def run_campaign(
                           f" — waiting {wait_s:.0f}s for window start")
                     await asyncio.sleep(wait_s)
 
+                # Resolve prefetch cache for this window's tokens
+                prefetched: Optional[tuple] = None
+                if (next_tokens_cache_window_ts == wts
+                        and next_tokens_cache_task is not None
+                        and next_tokens_cache_task.done()
+                        and not next_tokens_cache_task.cancelled()):
+                    try:
+                        prefetched = next_tokens_cache_task.result()
+                    except Exception:
+                        prefetched = None
+
+                prefetch_status = "hit" if prefetched is not None else "miss"
                 print(f"\n[m5] starting window {i+1}/{window_count}  ts={wts}"
                       f"  btc_now={state.btc_price}"
-                      f"  chainlink={state.chainlink_price}")
+                      f"  chainlink={state.chainlink_price}"
+                      f"  tokens_prefetch={prefetch_status}")
 
                 session = M5Session(
                     http_session=http,
@@ -151,22 +178,24 @@ async def run_campaign(
                     config=cfg,
                     time_fn=_time.time,
                     btc_history=btc_history,
+                    prefetched_tokens=prefetched,
                 )
                 record = await session.run(wts)
                 trades.append(record)
 
                 _print_record(record)
 
-                # write per-window artifact
+                # Capture the prefetch task launched inside run() for the next window
+                next_tokens_cache_window_ts = wts + cfg.window_seconds
+                next_tokens_cache_task = session.next_tokens_task
+
+                # Write per-window artifact
                 fname = output_dir / f"window_{i:03d}.json"
                 with fname.open("w") as f:
                     json.dump(dataclasses.asdict(record), f, indent=2)
 
-                # if next window would start immediately, sleep until boundary+buffer
-                now = _time.time()
-                time_to_next_boundary = wts + cfg.window_seconds - now
-                if time_to_next_boundary < 5 and i < window_count - 1:
-                    await asyncio.sleep(max(0.0, time_to_next_boundary + 5))
+                # Strict progression — never skip a window
+                wts += cfg.window_seconds
 
         finally:
             binance_task.cancel()
@@ -198,6 +227,8 @@ async def run_campaign(
     print(f"  avg_hedge_price     : {summary.avg_hedge_entry_price}")
     print(f"  avg_leg1_slippage   : {summary.avg_leg1_slippage}")
     print(f"  avg_hedge_slippage  : {summary.avg_hedge_slippage}")
+    print(f"  avg_resolution_lat  : {summary.avg_resolution_latency_s}")
+    print(f"  prefetch_token_hits : {summary.prefetched_token_hits}")
     print(f"\n[artifacts] {output_dir}/")
 
 
