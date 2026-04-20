@@ -77,6 +77,10 @@ class M5Config:
     window_seconds: int = 300
     # PTB: don't attempt before window_ts + this delay
     ptb_fetch_delay_s: float = 15.0
+    ptb_max_attempts: int = 10
+    ptb_retry_delay_s: float = 3.0
+    # Reject SSR when |ssr - api| > this (USD); use API instead
+    ptb_max_ssr_api_delta_usd: float = 10.0
     # Entry scan window [start, end)
     entry_scan_start_s: float = 140.0
     entry_scan_end_s: float = 170.0

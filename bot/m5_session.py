@@ -103,17 +103,42 @@ async def fetch_ptb_ssr(
     http: aiohttp.ClientSession,
     window_ts: int,
     base_url: str = _POLY_BASE,
+    *,
+    min_html_len: int = 500,
 ) -> Optional[float]:
-    """Scrape openPrice from Polymarket event page (__NEXT_DATA__ JSON)."""
+    """
+    Scrape openPrice from Polymarket event page, anchored to the specific window.
+
+    Uses the event slug or UTC ISO timestamp as a context anchor so that a global
+    openPrice that belongs to a different market/event is never picked up.
+    Returns None when HTML is too short, no anchor found, or value fails sanity check.
+    """
     url = f"{base_url}/event/btc-updown-5m-{window_ts}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; polybot/1.0)"}
     try:
-        async with http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 return None
             html = await resp.text()
-            m = re.search(r'"openPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', html)
-            if m:
-                return float(m.group(1))
+            if len(html) < min_html_len:
+                return None
+
+            # Anchors — try slug first, then ISO UTC variants
+            slug = f"btc-updown-5m-{window_ts}"
+            dt = datetime.datetime.fromtimestamp(window_ts, tz=datetime.timezone.utc)
+            iso_base = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            anchors = [slug, iso_base + "Z", iso_base + ".000Z", iso_base + "+00:00"]
+
+            for anchor in anchors:
+                idx = html.find(anchor)
+                if idx == -1:
+                    continue
+                context = html[max(0, idx - 200):idx + 1000]
+                m = re.search(r'"openPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', context)
+                if m:
+                    val = float(m.group(1))
+                    if val > 50.0:  # BTC price sanity floor
+                        return val
     except Exception:
         pass
     return None
@@ -169,7 +194,22 @@ async def fetch_ptb(
     return None, None
 
 
-async def fetch_ptb_full(
+@dataclass
+class PtbResult:
+    """Result of fetch_ptb_robust() — carries all audit and diagnostic fields."""
+    ptb: Optional[float]
+    source: Optional[str]           # "ssr" | "api" | "chainlink" | None
+    ptb_ssr: Optional[float]
+    ptb_api: Optional[float]
+    ptb_chainlink: Optional[float]
+    ptb_ssr_valid: bool
+    ptb_api_valid: bool
+    ptb_ssr_rejected_for_delta: bool
+    attempts: int
+    latency_s: Optional[float]
+
+
+async def fetch_ptb_robust(
     http: aiohttp.ClientSession,
     window_ts: int,
     chainlink_price: Optional[float] = None,
@@ -177,28 +217,100 @@ async def fetch_ptb_full(
     *,
     polymarket_base_url: str = _POLY_BASE,
     chainlink_max_age_s: float = 60.0,
-) -> tuple:  # (ptb, source, ssr_val, api_val, chainlink_val)
+    ptb_max_attempts: int = 10,
+    ptb_retry_delay_s: float = 3.0,
+    ptb_max_ssr_api_delta_usd: float = 10.0,
+    time_fn: Callable = _time.time,
+) -> PtbResult:
     """
-    Like fetch_ptb() but always attempts both SSR and API for audit purposes.
-    Returns (selected_ptb, source, ptb_ssr, ptb_api, ptb_chainlink).
-    Selection order: SSR → API → Chainlink.
-    """
-    ptb_ssr = await fetch_ptb_ssr(http, window_ts, polymarket_base_url)
-    ptb_api = await fetch_ptb_api(http, window_ts, polymarket_base_url)
+    Robust PTB fetch with retries, hardened SSR, and SSR/API delta guard.
 
-    ptb_cl = None
+    Selection:
+    - Both present, |delta| <= threshold → SSR (more direct source)
+    - Both present, |delta| > threshold  → API, ptb_ssr_rejected_for_delta=True
+    - SSR only → SSR
+    - API only → API
+    - Neither after all attempts → Chainlink last resort, or None
+    """
+    t_start = time_fn()
+
+    ptb_cl: Optional[float] = None
     if (chainlink_price is not None
             and chainlink_age_s is not None
             and chainlink_age_s < chainlink_max_age_s):
         ptb_cl = chainlink_price
 
-    if ptb_ssr is not None:
-        return ptb_ssr, "ssr", ptb_ssr, ptb_api, ptb_cl
-    if ptb_api is not None:
-        return ptb_api, "api", ptb_ssr, ptb_api, ptb_cl
+    ptb_ssr_last: Optional[float] = None
+    ptb_api_last: Optional[float] = None
+
+    for attempt in range(1, ptb_max_attempts + 1):
+        ptb_ssr = await fetch_ptb_ssr(http, window_ts, polymarket_base_url)
+        ptb_api = await fetch_ptb_api(http, window_ts, polymarket_base_url)
+        ptb_ssr_last = ptb_ssr
+        ptb_api_last = ptb_api
+
+        ssr_valid = ptb_ssr is not None
+        api_valid = ptb_api is not None
+
+        if not ssr_valid and not api_valid:
+            if attempt < ptb_max_attempts:
+                await asyncio.sleep(ptb_retry_delay_s)
+            continue
+
+        latency_s = time_fn() - t_start
+
+        if ssr_valid and api_valid:
+            delta = abs(ptb_ssr - ptb_api)
+            if delta > ptb_max_ssr_api_delta_usd:
+                return PtbResult(
+                    ptb=ptb_api, source="api",
+                    ptb_ssr=ptb_ssr, ptb_api=ptb_api, ptb_chainlink=ptb_cl,
+                    ptb_ssr_valid=True, ptb_api_valid=True,
+                    ptb_ssr_rejected_for_delta=True,
+                    attempts=attempt, latency_s=latency_s,
+                )
+            return PtbResult(
+                ptb=ptb_ssr, source="ssr",
+                ptb_ssr=ptb_ssr, ptb_api=ptb_api, ptb_chainlink=ptb_cl,
+                ptb_ssr_valid=True, ptb_api_valid=True,
+                ptb_ssr_rejected_for_delta=False,
+                attempts=attempt, latency_s=latency_s,
+            )
+
+        if ssr_valid:
+            return PtbResult(
+                ptb=ptb_ssr, source="ssr",
+                ptb_ssr=ptb_ssr, ptb_api=None, ptb_chainlink=ptb_cl,
+                ptb_ssr_valid=True, ptb_api_valid=False,
+                ptb_ssr_rejected_for_delta=False,
+                attempts=attempt, latency_s=latency_s,
+            )
+
+        return PtbResult(
+            ptb=ptb_api, source="api",
+            ptb_ssr=None, ptb_api=ptb_api, ptb_chainlink=ptb_cl,
+            ptb_ssr_valid=False, ptb_api_valid=True,
+            ptb_ssr_rejected_for_delta=False,
+            attempts=attempt, latency_s=latency_s,
+        )
+
+    # All attempts exhausted: Chainlink last resort
     if ptb_cl is not None:
-        return ptb_cl, "chainlink", ptb_ssr, ptb_api, ptb_cl
-    return None, None, ptb_ssr, ptb_api, ptb_cl
+        return PtbResult(
+            ptb=ptb_cl, source="chainlink",
+            ptb_ssr=ptb_ssr_last, ptb_api=ptb_api_last, ptb_chainlink=ptb_cl,
+            ptb_ssr_valid=False, ptb_api_valid=False,
+            ptb_ssr_rejected_for_delta=False,
+            attempts=ptb_max_attempts, latency_s=time_fn() - t_start,
+        )
+
+    return PtbResult(
+        ptb=None, source=None,
+        ptb_ssr=ptb_ssr_last, ptb_api=ptb_api_last, ptb_chainlink=ptb_cl,
+        ptb_ssr_valid=False, ptb_api_valid=False,
+        ptb_ssr_rejected_for_delta=False,
+        attempts=ptb_max_attempts, latency_s=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,34 +502,42 @@ class M5Session:
         # Phase 1: wait until PTB fetch is safe
         await self._sleep_until(window_ts + self._cfg.ptb_fetch_delay_s)
 
-        # Phase 2: fetch PTB (full audit — always tries both SSR and API)
+        # Phase 2: fetch PTB (robust — retries, delta guard, full audit)
         cl_price = self._signals.chainlink_price
         cl_age_s: Optional[float] = None
         if cl_price is not None and self._signals.chainlink_price_ts_ms is not None:
             cl_age_s = (self._time_fn() - self._signals.chainlink_price_ts_ms / 1000.0)
 
-        ptb, ptb_source, ptb_ssr, ptb_api, ptb_cl = await fetch_ptb_full(
+        pr = await fetch_ptb_robust(
             self._http, window_ts, cl_price, cl_age_s,
             polymarket_base_url=self._poly_url,
+            ptb_max_attempts=self._cfg.ptb_max_attempts,
+            ptb_retry_delay_s=self._cfg.ptb_retry_delay_s,
+            ptb_max_ssr_api_delta_usd=self._cfg.ptb_max_ssr_api_delta_usd,
+            time_fn=self._time_fn,
         )
-        # Populate PTB audit fields
-        record.ptb_ssr = ptb_ssr
-        record.ptb_api = ptb_api
-        record.ptb_chainlink = ptb_cl
+        record.ptb_ssr = pr.ptb_ssr
+        record.ptb_api = pr.ptb_api
+        record.ptb_chainlink = pr.ptb_chainlink
         record.ptb_ssr_api_delta_usd = (
-            round(ptb_ssr - ptb_api, 2)
-            if ptb_ssr is not None and ptb_api is not None else None
+            round(pr.ptb_ssr - pr.ptb_api, 2)
+            if pr.ptb_ssr is not None and pr.ptb_api is not None else None
         )
+        record.ptb_attempts = pr.attempts
+        record.ptb_retrieval_latency_s = pr.latency_s
+        record.ptb_ssr_valid = pr.ptb_ssr_valid
+        record.ptb_api_valid = pr.ptb_api_valid
+        record.ptb_ssr_rejected_for_delta = pr.ptb_ssr_rejected_for_delta
 
-        if ptb is None:
+        if pr.ptb is None:
             record.abort_reason = "ptb_unavailable"
             return record
-        record.ptb = ptb
-        record.ptb_source = ptb_source
-        record.ptb_selected = ptb
-        record.ptb_selected_source = ptb_source
+        record.ptb = pr.ptb
+        record.ptb_source = pr.source
+        record.ptb_selected = pr.ptb
+        record.ptb_selected_source = pr.source
         record.ptb_selected_api_delta_usd = (
-            round(ptb - ptb_api, 2) if ptb_api is not None else None
+            round(pr.ptb - pr.ptb_api, 2) if pr.ptb_api is not None else None
         )
 
         # Phase 3: token discovery (use prefetch cache if available)
@@ -435,7 +555,7 @@ class M5Session:
         poll_task = asyncio.create_task(self._poll_token_prices(up_id, down_id))
 
         try:
-            await self._trading_phases(record, ptb, window_ts, up_id, down_id)
+            await self._trading_phases(record, pr.ptb, window_ts, up_id, down_id)
         finally:
             poll_task.cancel()
             try:
@@ -473,7 +593,7 @@ class M5Session:
             if close_price is not None:
                 s = compute_settlement(
                     close_price=close_price,
-                    open_price=ptb,
+                    open_price=pr.ptb,
                     leg1_side=record.entry_side,
                     leg1_entry_price=record.entry_price,
                     leg1_shares=record.entry_shares or 0.0,
