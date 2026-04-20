@@ -89,8 +89,10 @@ def _print_record(record: TradeRecord) -> None:
           f"  t={record.entry_elapsed_s:.1f}s  price={record.entry_price:.4f}"
           f"  shares={record.entry_shares:.4f}")
     if record.entry_mode == "early":
-        print(f"  consensus: score={record.entry_consensus_score:.1f}"
-              f"  non_neutral={record.entry_consensus_non_neutral}")
+        print(f"  model  : p_up={record.p_model_up_at_entry:.3f}"
+              f"  z_gap={record.z_gap_at_entry:.2f}"
+              f"  sigma={record.sigma_to_close_at_entry:.1f}"
+              f"  edge_up={record.edge_up_at_entry:.3f}")
     if record.leg1_slippage is not None:
         print(f"  leg1_trace: ask={record.leg1_observed_ask:.4f}"
               f"  attempted={record.leg1_attempted_price:.4f}"

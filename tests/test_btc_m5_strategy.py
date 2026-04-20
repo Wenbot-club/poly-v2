@@ -1,14 +1,15 @@
 """
-BTC M5 strategy tests — 26 tests across 5 groups.
+BTC M5 strategy tests — 34 tests across 6 groups.
 
 Tests 1-4   : PTB fetching (SSR, API, Chainlink fallback, stale rejection)
-Tests 5-7   : EARLY consensus
-Tests 8-10  : baseline direction
-Tests 11-14 : hedge trigger + no-second-hedge + cutoff block
-Tests 15-16 : price_insane guard
-Tests 17-19 : settlement P&L
-Test  20    : aggregate summary
-Tests 21-24 : integration (BtcHistory, Chainlink vote, separate traces, settlement)
+Tests 5-15  : Probabilistic entry model (sigma, score, entry gates)
+Tests 16-18 : Baseline direction
+Tests 19-22 : Hedge trigger + no-second-hedge + cutoff block
+Tests 23-24 : price_insane guard
+Tests 25-27 : Settlement P&L
+Tests 28-29 : Aggregate summary (counters + model diagnostics)
+Tests 30-31 : LEG1/HEDGE trace independence + settlement with both legs
+Tests 32-34 : Integration (model fields on record, block counts in summary)
 """
 from __future__ import annotations
 
@@ -32,7 +33,8 @@ from bot.m5_session import (
 from bot.m5_summary import TradeRecord, aggregate_trades
 from bot.settings import M5Config
 from bot.strategy.btc_m5 import (
-    compute_consensus,
+    estimate_sigma_to_close,
+    compute_entry_signal,
     baseline_direction,
     should_hedge,
     compute_settlement,
@@ -157,58 +159,157 @@ def test_ptb_chainlink_rejected_if_stale():
 
 
 # ---------------------------------------------------------------------------
-# Tests 4-6: EARLY consensus
+# Tests 5-15: Probabilistic entry model
 # ---------------------------------------------------------------------------
 
-def test_consensus_early_up_triggered():
-    """Strong UP consensus (score >= 88) → direction='up'."""
-    result = compute_consensus(
-        btc=85_100.0, ptb=85_000.0,       # +1
-        chainlink=85_050.0,               # +1
-        btc_10s=84_900.0,                 # btc > 10s ago → +1
-        btc_30s=84_800.0,                 # +1
-        btc_60s=84_700.0,                 # +1
-        price_up=0.65,                    # > 0.55 → +1
-        # gap = +100 > 5 → +1, > 20 → +1
-        threshold=88.0, min_non_neutral=3,
+# Helpers for this section
+_FLAT = [(i * 1_000, 85_000.0) for i in range(60)]   # 60 flat ticks → sigma = floor
+_TAU = 155.0  # window_seconds=300, elapsed=145
+
+
+def test_sigma_floor_when_insufficient_history():
+    """Returns floor when fewer than 3 samples or all-zero variance."""
+    assert estimate_sigma_to_close([], tau_s=100.0, sigma_floor_usd=5.0) == 5.0
+    assert estimate_sigma_to_close([(0, 100.0), (1_000, 101.0)], tau_s=100.0, sigma_floor_usd=5.0) == 5.0
+    # Flat samples: variance = 0 → floor
+    assert estimate_sigma_to_close(_FLAT, tau_s=_TAU, sigma_floor_usd=5.0) == 5.0
+
+
+def test_larger_sigma_reduces_p_model_up():
+    """Same gap, higher historical vol → smaller z_gap → p_model_up closer to 0.5."""
+    # Low vol: alternating ±0.5 → dp ≈ ±1.0 → var_per_s ≈ 1.0 → sigma ≈ 11.8
+    samples_low = [(i * 1_000, 85_000.0 + (0.5 if i % 2 == 0 else -0.5)) for i in range(60)]
+    # High vol: alternating ±50 → dp ≈ ±100 → var_per_s ≈ 10000 → sigma ≈ 1183
+    samples_high = [(i * 1_000, 85_000.0 + (50.0 if i % 2 == 0 else -50.0)) for i in range(60)]
+
+    kwargs = dict(
+        btc=85_100.0, ptb=85_000.0, tau_s=140.0,
+        btc_10s=None, btc_30s=None,
+        price_up=0.50, price_down=0.50,
+        sigma_floor_usd=0.1,   # tiny floor so real vol dominates
+        z_gap_min=0.0, p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.0,
     )
-    assert result.direction == "up"
-    assert result.score >= 88.0
-    assert result.non_neutral >= 3
+    sig_low = compute_entry_signal(btc_samples=samples_low, **kwargs)
+    sig_high = compute_entry_signal(btc_samples=samples_high, **kwargs)
+
+    assert sig_low.p_model_up > sig_high.p_model_up
+    assert sig_low.p_model_up > 0.99
+    assert sig_high.p_model_up < 0.60
 
 
-def test_consensus_early_down_triggered():
-    """Strong DOWN consensus (score <= 12) → direction='down'."""
-    result = compute_consensus(
-        btc=84_900.0, ptb=85_000.0,       # -1
-        chainlink=84_950.0,               # -1
-        btc_10s=85_100.0,                 # btc < 10s ago → -1
-        btc_30s=85_200.0,                 # -1
-        btc_60s=85_300.0,                 # -1
-        price_up=0.30,                    # < 0.45 → -1
-        # gap = -100 < -5 → -1, < -20 → -1
-        threshold=88.0, min_non_neutral=3,
+def test_larger_gap_increases_p_model_up():
+    """Larger positive gap → higher z_gap → higher p_model_up."""
+    base = dict(
+        ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        price_up=0.50, price_down=0.50,
+        sigma_floor_usd=5.0, z_gap_min=0.0,
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.0,
     )
-    assert result.direction == "down"
-    assert result.score <= 12.0
-    assert result.non_neutral >= 3
+    sig_small = compute_entry_signal(btc=85_010.0, **base)   # gap = 10
+    sig_large = compute_entry_signal(btc=85_050.0, **base)   # gap = 50
+
+    assert sig_large.p_model_up > sig_small.p_model_up
 
 
-def test_consensus_no_entry_if_non_neutral_below_minimum():
-    """Fewer than 3 non-neutral votes → direction=None."""
-    result = compute_consensus(
-        btc=85_000.0, ptb=85_000.0,       # 0 (equal)
-        chainlink=85_000.0,               # 0
-        btc_10s=85_000.0,                 # 0
-        btc_30s=None,                     # 0
-        btc_60s=None,                     # 0
-        price_up=0.50,                    # 0 (neutral zone)
-        # gap = 0 → 0, 0
-        threshold=88.0, min_non_neutral=3,
+def test_price_tokens_do_not_affect_model_probability():
+    """Changing price_up/price_down changes edge but never p_model_up."""
+    base = dict(
+        btc=85_100.0, ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        sigma_floor_usd=5.0, z_gap_min=0.0,
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.0,
     )
-    assert result.direction is None
-    assert result.reason == "insufficient_non_neutral"
-    assert result.non_neutral < 3
+    sig_a = compute_entry_signal(price_up=0.50, price_down=0.50, **base)
+    sig_b = compute_entry_signal(price_up=0.70, price_down=0.30, **base)
+
+    assert sig_a.p_model_up == pytest.approx(sig_b.p_model_up)
+    assert sig_a.edge_up > sig_b.edge_up   # cheap market gives more edge
+
+
+def test_chainlink_not_in_entry_signal_signature():
+    """compute_entry_signal has no chainlink parameter — by design."""
+    import inspect
+    params = inspect.signature(compute_entry_signal).parameters
+    assert "chainlink" not in params
+
+
+def test_noise_zone_blocks_entry():
+    """abs(z_gap) < z_gap_min → direction=None, block_reason='noise_zone'."""
+    # gap = 1.0, sigma_floor = 5.0 → z_gap = 0.20 < 0.35
+    sig = compute_entry_signal(
+        btc=85_001.0, ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        price_up=0.50, price_down=0.50,
+        sigma_floor_usd=5.0, z_gap_min=0.35,
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.0,
+    )
+    assert sig.direction is None
+    assert sig.block_reason == "noise_zone"
+    assert abs(sig.z_gap) < 0.35
+
+
+def test_buy_up_on_strong_signal_and_edge():
+    """Large positive z_gap + cheap price_up → direction='up'."""
+    # gap = 100, sigma = 5.0, z_gap = 20 → p ≈ 1.0; edge = 1.0 - 0.45 = 0.55
+    sig = compute_entry_signal(
+        btc=85_100.0, ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        price_up=0.45, price_down=0.55,
+        sigma_floor_usd=5.0, z_gap_min=0.35,
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.06,
+    )
+    assert sig.direction == "up"
+    assert sig.block_reason is None
+    assert sig.p_model_up >= 0.60
+    assert sig.edge_up >= 0.06
+
+
+def test_buy_down_on_strong_signal_and_edge():
+    """Large negative z_gap + cheap price_down → direction='down'."""
+    # gap = -100, sigma = 5.0, z_gap = -20 → p ≈ 0.0; edge_down = 1.0 - 0.45 = 0.55
+    sig = compute_entry_signal(
+        btc=84_900.0, ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        price_up=0.55, price_down=0.45,
+        sigma_floor_usd=5.0, z_gap_min=0.35,
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.06,
+    )
+    assert sig.direction == "down"
+    assert sig.block_reason is None
+    assert sig.p_model_up <= 0.40
+    assert sig.edge_down >= 0.06
+
+
+def test_no_trade_when_edge_insufficient():
+    """p_model_up crosses threshold but price_up too close → edge_not_enough."""
+    # gap ≈ 2.3 → z_gap ≈ 0.46 → score ≈ 0.62 → p ≈ 0.65 >= 0.60
+    # price_up = 0.62 → edge = 0.03 < 0.06
+    sig = compute_entry_signal(
+        btc=85_002.3, ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        price_up=0.62, price_down=0.38,
+        sigma_floor_usd=5.0, z_gap_min=0.35,
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.06,
+    )
+    assert sig.direction is None
+    assert sig.block_reason == "edge_not_enough"
+    assert sig.p_model_up >= 0.60
+    assert sig.edge_up < 0.06
+
+
+def test_probability_not_strong_enough_between_thresholds():
+    """p_model_up in (0.40, 0.60) → direction=None, block_reason='probability_not_strong_enough'."""
+    # gap near 0 → p ≈ 0.50
+    sig = compute_entry_signal(
+        btc=85_000.5, ptb=85_000.0, tau_s=_TAU, btc_samples=_FLAT,
+        btc_10s=None, btc_30s=None,
+        price_up=0.44, price_down=0.56,  # edge_up > min but p not strong enough
+        sigma_floor_usd=5.0, z_gap_min=0.0,   # z_gap_min=0 so noise zone doesn't block first
+        p_enter_up_min=0.60, p_enter_down_max=0.40, min_entry_edge=0.0,
+    )
+    assert sig.direction is None
+    assert sig.block_reason == "probability_not_strong_enough"
 
 
 # ---------------------------------------------------------------------------
@@ -432,22 +533,20 @@ def test_aggregate_summary_correct():
 # Integration tests
 # ---------------------------------------------------------------------------
 
-def test_early_entry_uses_injected_btc_history():
-    """BtcHistory momentum votes reach compute_consensus when history is injected."""
+def test_trade_record_stores_model_fields_on_early_entry():
+    """After EARLY entry, TradeRecord carries all model observation fields."""
     window_ts = 1_000_000
+    # Flat history → sigma = floor = 5.0; gap = 100 → z_gap = 20 >> 0.35
     now_ms = int((window_ts + 145.0) * 1000)
-
     history = BtcHistory()
-    history.record(84_800.0, now_ms - 65_000)   # ~65s ago
-    history.record(84_850.0, now_ms - 35_000)   # ~35s ago
-    history.record(84_900.0, now_ms - 12_000)   # ~12s ago
+    for i in range(60):
+        history.record(85_000.0, now_ms - (60 - i) * 1_000)
 
-    # BTC now above all history → momentum signals all +1; chainlink also above PTB
-    signal = M5SignalState(btc_price=85_100.0, chainlink_price=85_050.0)
+    signal = M5SignalState(btc_price=85_100.0)
     session = _make_session(
         signal=signal,
         time_fn=lambda: window_ts + 145.0,
-        token_prices={"up": 0.65, "dn": 0.35},
+        token_prices={"up": 0.45, "dn": 0.55},
         btc_history=history,
     )
 
@@ -459,24 +558,37 @@ def test_early_entry_uses_injected_btc_history():
     assert entered is True
     assert record.entry_mode == "early"
     assert record.entry_side == "up"
-    # All 8 signals aligned → score == 100 (>= threshold 88)
-    assert record.entry_consensus_score == pytest.approx(100.0)
-    assert record.entry_consensus_non_neutral == 8
+    assert record.p_model_up_at_entry is not None
+    assert record.p_model_up_at_entry >= 0.60
+    assert record.z_gap_at_entry is not None
+    assert record.z_gap_at_entry == pytest.approx(100.0 / 5.0, rel=0.05)
+    assert record.sigma_to_close_at_entry == pytest.approx(5.0, rel=0.05)
+    assert record.edge_up_at_entry is not None
+    assert record.edge_up_at_entry >= 0.06
+    assert record.entry_block_reason is None
 
 
-def test_chainlink_vote_counted_in_consensus():
-    """Removing chainlink reduces non_neutral count by exactly one vote."""
-    kwargs = dict(
-        btc=85_100.0, ptb=85_000.0,
-        btc_10s=84_900.0, btc_30s=84_800.0, btc_60s=84_700.0,
-        price_up=0.65,
-        threshold=88.0, min_non_neutral=3,
+def test_campaign_summary_aggregates_block_counts():
+    """M5CampaignSummary counts all three block_reason values and averages model fields."""
+    t1 = TradeRecord(window_ts=1000, entry_block_reason="noise_zone")
+    t2 = TradeRecord(window_ts=2000, entry_block_reason="edge_not_enough")
+    t3 = TradeRecord(window_ts=3000, entry_block_reason="edge_not_enough")
+    t4 = TradeRecord(window_ts=4000, entry_block_reason="probability_not_strong_enough")
+    t5 = TradeRecord(
+        window_ts=5000,
+        entry_mode="early", entry_side="up", entry_price=0.60,
+        entry_shares=1.0 / 0.60,
+        p_model_up_at_entry=0.72, sigma_to_close_at_entry=12.0,
+        pnl_leg1=0.50, pnl_hedge=0.0, net_pnl=0.50,
     )
-    with_cl = compute_consensus(chainlink=85_050.0, **kwargs)
-    without_cl = compute_consensus(chainlink=None, **kwargs)
 
-    assert with_cl.non_neutral == without_cl.non_neutral + 1
-    assert with_cl.up_votes == without_cl.up_votes + 1
+    summary = aggregate_trades([t1, t2, t3, t4, t5])
+
+    assert summary.blocked_by_noise_zone_count == 1
+    assert summary.blocked_by_edge_count == 2
+    assert summary.blocked_by_probability_count == 1
+    assert summary.avg_p_model_up_at_entry == pytest.approx(0.72)
+    assert summary.avg_sigma_to_close_at_entry == pytest.approx(12.0)
 
 
 def test_leg1_and_hedge_fill_traces_are_independent():

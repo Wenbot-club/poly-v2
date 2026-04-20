@@ -36,8 +36,8 @@ import aiohttp
 from .m5_summary import TradeRecord
 from .settings import M5Config, DEFAULT_M5_CONFIG
 from .strategy.btc_m5 import (
-    ConsensusResult,
-    compute_consensus,
+    EntrySignal,
+    compute_entry_signal,
     baseline_direction,
     should_hedge,
     compute_settlement,
@@ -88,6 +88,10 @@ class BtcHistory:
                 best_dist = dist
                 best = price
         return best if best_dist <= self._MAX_TOLERANCE_MS else None
+
+    def recent_samples(self, since_ms: int) -> list:
+        """Return [(ts_ms, price)] for all samples at or after since_ms."""
+        return [(ts, p) for ts, p in self._samples if ts >= since_ms]
 
 
 # ---------------------------------------------------------------------------
@@ -411,9 +415,9 @@ class M5Session:
         window_end_s = window_ts + cfg.window_seconds
 
         # EARLY scan: wait for window start then poll every 500ms
-        await self._sleep_until(window_ts + cfg.early_window_start_s)
+        await self._sleep_until(window_ts + cfg.entry_scan_start_s)
 
-        while self._elapsed(window_ts) < cfg.early_window_end_s:
+        while self._elapsed(window_ts) < cfg.entry_scan_end_s:
             if await self._try_early_entry(record, ptb, up_id, down_id, window_ts):
                 break
             await asyncio.sleep(cfg.early_poll_interval_s)
@@ -441,39 +445,55 @@ class M5Session:
     ) -> bool:
         btc = self._signals.btc_price
         if btc is None:
+            record.entry_block_reason = "no_btc_price"
             return False
 
+        elapsed_s = self._elapsed(window_ts)
+        tau_s = self._cfg.window_seconds - elapsed_s
         now_ms = int(self._time_fn() * 1000)
-        consensus = compute_consensus(
-            btc=btc, ptb=ptb,
-            chainlink=self._signals.chainlink_price,
+        since_ms = now_ms - int(self._cfg.sigma_lookback_s * 1000)
+
+        sig = compute_entry_signal(
+            btc=btc, ptb=ptb, tau_s=tau_s,
+            btc_samples=self._btc_history.recent_samples(since_ms),
             btc_10s=self._btc_history.price_n_secs_ago(10, now_ms),
             btc_30s=self._btc_history.price_n_secs_ago(30, now_ms),
-            btc_60s=self._btc_history.price_n_secs_ago(60, now_ms),
             price_up=self._token_prices.get(up_id),
-            threshold=self._cfg.early_consensus_threshold,
-            min_non_neutral=self._cfg.early_min_non_neutral,
+            price_down=self._token_prices.get(down_id),
+            sigma_floor_usd=self._cfg.sigma_floor_usd,
+            z_gap_min=self._cfg.z_gap_min,
+            p_enter_up_min=self._cfg.p_enter_up_min,
+            p_enter_down_max=self._cfg.p_enter_down_max,
+            min_entry_edge=self._cfg.min_entry_edge,
         )
-        if consensus.direction is None:
+
+        if sig.direction is None:
+            record.entry_block_reason = sig.block_reason
             return False
 
-        token_id = up_id if consensus.direction == "up" else down_id
+        token_id = up_id if sig.direction == "up" else down_id
         best_ask = self._token_prices.get(token_id)
         if best_ask is None:
+            record.entry_block_reason = "no_token_price"
             return False
 
         fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
         self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
+            record.entry_block_reason = fill.reject_reason
             return False
 
         record.entry_mode = "early"
-        record.entry_side = consensus.direction
-        record.entry_elapsed_s = self._elapsed(window_ts)
+        record.entry_side = sig.direction
+        record.entry_elapsed_s = elapsed_s
         record.entry_price = fill.fill_price
         record.entry_shares = fill.shares
-        record.entry_consensus_score = consensus.score
-        record.entry_consensus_non_neutral = consensus.non_neutral
+        record.p_model_up_at_entry = sig.p_model_up
+        record.edge_up_at_entry = sig.edge_up
+        record.edge_down_at_entry = sig.edge_down
+        record.z_gap_at_entry = sig.z_gap
+        record.sigma_to_close_at_entry = sig.sigma_to_close
+        record.entry_block_reason = None
         return True
 
     # ------------------------------------------------------------------

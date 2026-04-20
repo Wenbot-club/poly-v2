@@ -77,12 +77,17 @@ class M5Config:
     window_seconds: int = 300
     # PTB: don't attempt before window_ts + this delay
     ptb_fetch_delay_s: float = 15.0
-    # EARLY entry window [start, end)
-    early_window_start_s: float = 140.0
-    early_window_end_s: float = 170.0
-    early_consensus_threshold: float = 88.0
-    early_min_non_neutral: int = 3
+    # Entry scan window [start, end)
+    entry_scan_start_s: float = 140.0
+    entry_scan_end_s: float = 170.0
     early_poll_interval_s: float = 0.5
+    # Probabilistic entry model
+    sigma_lookback_s: float = 60.0
+    sigma_floor_usd: float = 5.0
+    z_gap_min: float = 0.35
+    p_enter_up_min: float = 0.60
+    p_enter_down_max: float = 0.40
+    min_entry_edge: float = 0.06
     # Baseline entry
     baseline_elapsed_s: float = 170.0
     # Sizing

@@ -2,107 +2,167 @@
 Pure BTC M5 strategy logic — no I/O.
 
 Implements:
-  - 8-signal consensus for EARLY entry (140-170s)
-  - baseline direction at 170s
+  - Probabilistic PTB-close model for EARLY entry (entry_scan_start_s – entry_scan_end_s)
+  - estimate_sigma_to_close: rolling vol from BtcHistory samples, scaled by sqrt(tau_s)
+  - compute_entry_signal: sigmoid(z_gap + momentum), edge vs Polymarket price
+  - baseline direction at entry_scan_end_s
   - single hedge trigger (Binance vs PTB)
   - settlement P&L calculation (win = (1-entry)*shares, loss = -usd_staked)
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Consensus
+# Volatility estimation
+# ---------------------------------------------------------------------------
+
+def estimate_sigma_to_close(
+    samples: list[tuple[int, float]],
+    tau_s: float,
+    sigma_floor_usd: float = 5.0,
+) -> float:
+    """
+    Estimate remaining price vol (USD) from now to window close.
+
+    Computes mean(dp² / dt_s) over the provided (ts_ms, price) samples —
+    an estimate of variance per second — then scales by sqrt(tau_s).
+
+    Returns max(estimate, sigma_floor_usd).
+    """
+    if len(samples) < 3:
+        return sigma_floor_usd
+
+    contributions: list[float] = []
+    for i in range(1, len(samples)):
+        dt_s = (samples[i][0] - samples[i - 1][0]) / 1000.0
+        if dt_s <= 0:
+            continue
+        dp = samples[i][1] - samples[i - 1][1]
+        contributions.append(dp * dp / dt_s)
+
+    if not contributions:
+        return sigma_floor_usd
+
+    var_per_s = sum(contributions) / len(contributions)
+    sigma_to_close = math.sqrt(var_per_s * max(tau_s, 0.0))
+    return max(sigma_to_close, sigma_floor_usd)
+
+
+# ---------------------------------------------------------------------------
+# Probabilistic entry signal
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ConsensusResult:
-    score: float            # 0-100; >50 = up-leaning
-    up_votes: int
-    down_votes: int
-    non_neutral: int
-    direction: Optional[str]    # "up" | "down" | None
-    reason: Optional[str]       # None when direction is set
+class EntrySignal:
+    direction: Optional[str]        # "up" | "down" | None
+    p_model_up: float               # 0–1
+    z_gap: float
+    sigma_to_close: float
+    edge_up: float                  # p_model_up - price_up
+    edge_down: float                # (1 - p_model_up) - price_down
+    block_reason: Optional[str]     # None when direction is set
 
 
-def compute_consensus(
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def compute_entry_signal(
     btc: float,
     ptb: float,
-    chainlink: Optional[float],
+    tau_s: float,
+    btc_samples: list[tuple[int, float]],
     btc_10s: Optional[float],
     btc_30s: Optional[float],
-    btc_60s: Optional[float],
     price_up: Optional[float],
+    price_down: Optional[float],
     *,
-    threshold: float = 88.0,
-    min_non_neutral: int = 3,
-) -> ConsensusResult:
+    sigma_floor_usd: float = 5.0,
+    z_gap_min: float = 0.35,
+    p_enter_up_min: float = 0.60,
+    p_enter_down_max: float = 0.40,
+    min_entry_edge: float = 0.06,
+) -> EntrySignal:
     """
-    8-signal binary consensus.
+    Probabilistic PTB-close model.
 
-    Signals (each returns +1=up, -1=down, 0=neutral):
-      1. btc vs ptb
-      2. chainlink vs ptb
-      3. btc vs btc_10s_ago
-      4. btc vs btc_30s_ago
-      5. btc vs btc_60s_ago
-      6. price_up token: >0.55=+1, <0.45=-1, else 0
-      7. btc - ptb > 5 → +1, < -5 → -1
-      8. btc - ptb > 20 → +1, < -20 → -1
+    score_raw = 1.35 * z_gap + 0.35 * mom10_norm + 0.20 * mom30_norm
+    p_model_up = sigmoid(score_raw)
 
-    score = 100 * up_votes / non_neutral_votes
-    Requires min_non_neutral votes; otherwise direction=None.
-    threshold=88 → ≥88 = UP, ≤12 = DOWN, else None.
+    Chainlink is not used here — it remains a PTB fallback only.
+
+    Entry gates (in order):
+      1. abs(z_gap) < z_gap_min              → block_reason="noise_zone"
+      2. p_model_up >= p_enter_up_min
+           edge_up >= min_entry_edge         → direction="up"
+           else                             → block_reason="edge_not_enough"
+      3. p_model_up <= p_enter_down_max
+           edge_down >= min_entry_edge       → direction="down"
+           else                             → block_reason="edge_not_enough"
+      4. otherwise                          → block_reason="probability_not_strong_enough"
     """
+    sigma = estimate_sigma_to_close(btc_samples, tau_s, sigma_floor_usd)
     gap = btc - ptb
+    z_gap = gap / sigma
 
-    def _cmp(a: Optional[float], b: Optional[float]) -> int:
-        if a is None or b is None:
-            return 0
-        if a > b:
-            return 1
-        if a < b:
-            return -1
-        return 0
+    mom10_norm = (btc - btc_10s) / sigma if btc_10s is not None else 0.0
+    mom30_norm = (btc - btc_30s) / sigma if btc_30s is not None else 0.0
 
-    votes = [
-        _cmp(btc, ptb),
-        _cmp(chainlink, ptb),
-        _cmp(btc, btc_10s),
-        _cmp(btc, btc_30s),
-        _cmp(btc, btc_60s),
-        (1 if price_up is not None and price_up > 0.55
-         else -1 if price_up is not None and price_up < 0.45
-         else 0),
-        (1 if gap > 5 else -1 if gap < -5 else 0),
-        (1 if gap > 20 else -1 if gap < -20 else 0),
-    ]
+    score_raw = 1.35 * z_gap + 0.35 * mom10_norm + 0.20 * mom30_norm
+    p_model_up = _sigmoid(score_raw)
 
-    up_votes = sum(1 for v in votes if v == 1)
-    down_votes = sum(1 for v in votes if v == -1)
-    non_neutral = up_votes + down_votes
+    _price_up = price_up if price_up is not None else 0.50
+    _price_down = price_down if price_down is not None else 0.50
+    edge_up = p_model_up - _price_up
+    edge_down = (1.0 - p_model_up) - _price_down
 
-    if non_neutral < min_non_neutral:
-        return ConsensusResult(
-            score=50.0, up_votes=up_votes, down_votes=down_votes,
-            non_neutral=non_neutral, direction=None,
-            reason="insufficient_non_neutral",
+    if abs(z_gap) < z_gap_min:
+        return EntrySignal(
+            direction=None, p_model_up=p_model_up,
+            z_gap=z_gap, sigma_to_close=sigma,
+            edge_up=edge_up, edge_down=edge_down,
+            block_reason="noise_zone",
         )
 
-    score = 100.0 * up_votes / non_neutral
+    if p_model_up >= p_enter_up_min:
+        if edge_up >= min_entry_edge:
+            return EntrySignal(
+                direction="up", p_model_up=p_model_up,
+                z_gap=z_gap, sigma_to_close=sigma,
+                edge_up=edge_up, edge_down=edge_down,
+                block_reason=None,
+            )
+        return EntrySignal(
+            direction=None, p_model_up=p_model_up,
+            z_gap=z_gap, sigma_to_close=sigma,
+            edge_up=edge_up, edge_down=edge_down,
+            block_reason="edge_not_enough",
+        )
 
-    if score >= threshold:
-        direction, reason = "up", None
-    elif score <= (100.0 - threshold):
-        direction, reason = "down", None
-    else:
-        direction, reason = None, "score_inconclusive"
+    if p_model_up <= p_enter_down_max:
+        if edge_down >= min_entry_edge:
+            return EntrySignal(
+                direction="down", p_model_up=p_model_up,
+                z_gap=z_gap, sigma_to_close=sigma,
+                edge_up=edge_up, edge_down=edge_down,
+                block_reason=None,
+            )
+        return EntrySignal(
+            direction=None, p_model_up=p_model_up,
+            z_gap=z_gap, sigma_to_close=sigma,
+            edge_up=edge_up, edge_down=edge_down,
+            block_reason="edge_not_enough",
+        )
 
-    return ConsensusResult(
-        score=score, up_votes=up_votes, down_votes=down_votes,
-        non_neutral=non_neutral, direction=direction, reason=reason,
+    return EntrySignal(
+        direction=None, p_model_up=p_model_up,
+        z_gap=z_gap, sigma_to_close=sigma,
+        edge_up=edge_up, edge_down=edge_down,
+        block_reason="probability_not_strong_enough",
     )
 
 

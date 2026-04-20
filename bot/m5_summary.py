@@ -24,8 +24,13 @@ class TradeRecord:
     entry_elapsed_s: Optional[float] = None
     entry_price: Optional[float] = None
     entry_shares: Optional[float] = None
-    entry_consensus_score: Optional[float] = None
-    entry_consensus_non_neutral: Optional[int] = None
+
+    # Probabilistic model observation at entry (EARLY only)
+    p_model_up_at_entry: Optional[float] = None
+    edge_up_at_entry: Optional[float] = None
+    edge_down_at_entry: Optional[float] = None
+    z_gap_at_entry: Optional[float] = None
+    sigma_to_close_at_entry: Optional[float] = None
 
     # HEDGE
     hedged: bool = False
@@ -57,8 +62,9 @@ class TradeRecord:
     pnl_hedge: Optional[float] = None
     net_pnl: Optional[float] = None
 
-    # Abort
+    # Abort / block
     abort_reason: Optional[str] = None         # "ptb_unavailable" | "tokens_unavailable" | ...
+    entry_block_reason: Optional[str] = None   # "noise_zone" | "edge_not_enough" | "probability_not_strong_enough" | ...
 
 
 @dataclass
@@ -79,6 +85,12 @@ class M5CampaignSummary:
     avg_hedge_entry_price: Optional[float]
     avg_leg1_slippage: Optional[float]
     avg_hedge_slippage: Optional[float]
+    # Probabilistic model diagnostics
+    avg_p_model_up_at_entry: Optional[float] = None
+    avg_sigma_to_close_at_entry: Optional[float] = None
+    blocked_by_noise_zone_count: int = 0
+    blocked_by_edge_count: int = 0
+    blocked_by_probability_count: int = 0
     trades: list = field(default_factory=list)  # list[TradeRecord]
 
 
@@ -95,12 +107,16 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
     leg1_slippages = [t.leg1_slippage for t in entered if t.leg1_slippage is not None]
     hedge_slippages = [t.hedge_slippage for t in hedged if t.hedge_slippage is not None]
 
+    early_entered = [t for t in entered if t.entry_mode == "early"]
+    p_vals = [t.p_model_up_at_entry for t in early_entered if t.p_model_up_at_entry is not None]
+    sigma_vals = [t.sigma_to_close_at_entry for t in early_entered if t.sigma_to_close_at_entry is not None]
+
     return M5CampaignSummary(
         windows_seen=len(trades),
         ptb_fail_count=sum(1 for t in trades if t.abort_reason == "ptb_unavailable"),
         token_setup_fail_count=sum(1 for t in trades if t.abort_reason == "tokens_unavailable"),
         leg1_entered_count=len(entered),
-        early_entry_count=sum(1 for t in entered if t.entry_mode == "early"),
+        early_entry_count=len(early_entered),
         baseline_entry_count=sum(1 for t in entered if t.entry_mode == "baseline"),
         hedge_triggered_count=len(hedged),
         hedge_blocked_by_cutoff_count=sum(1 for t in trades if t.hedge_blocked_by_cutoff),
@@ -119,6 +135,21 @@ def aggregate_trades(trades: list) -> M5CampaignSummary:
         ),
         avg_hedge_slippage=(
             sum(hedge_slippages) / len(hedge_slippages) if hedge_slippages else None
+        ),
+        avg_p_model_up_at_entry=(
+            sum(p_vals) / len(p_vals) if p_vals else None
+        ),
+        avg_sigma_to_close_at_entry=(
+            sum(sigma_vals) / len(sigma_vals) if sigma_vals else None
+        ),
+        blocked_by_noise_zone_count=sum(
+            1 for t in trades if t.entry_block_reason == "noise_zone"
+        ),
+        blocked_by_edge_count=sum(
+            1 for t in trades if t.entry_block_reason == "edge_not_enough"
+        ),
+        blocked_by_probability_count=sum(
+            1 for t in trades if t.entry_block_reason == "probability_not_strong_enough"
         ),
         trades=trades,
     )
