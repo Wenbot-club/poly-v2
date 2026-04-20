@@ -34,6 +34,13 @@ class TradeRecord:
     ptb_ssr_api_delta_usd: Optional[float] = None
     ptb_selected_api_delta_usd: Optional[float] = None
 
+    # PTB retrieval diagnostics
+    ptb_attempts: int = 0
+    ptb_retrieval_latency_s: Optional[float] = None
+    ptb_ssr_valid: Optional[bool] = None
+    ptb_api_valid: Optional[bool] = None
+    ptb_ssr_rejected_for_delta: bool = False
+
     # LEG1
     entry_mode: Optional[str] = None           # "early" | "baseline"
     entry_side: Optional[str] = None           # "up" | "down"

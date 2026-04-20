@@ -1,5 +1,5 @@
 """
-BTC M5 strategy tests — 45 tests across 8 groups.
+BTC M5 strategy tests — 52 tests across 9 groups.
 
 Tests 1-4   : PTB fetching (SSR, API, Chainlink fallback, stale rejection)
 Tests 5-15  : Probabilistic entry model (sigma, score, entry gates)
@@ -12,6 +12,7 @@ Tests 30-31 : LEG1/HEDGE trace independence + settlement with both legs
 Tests 32-34 : Integration (model fields on record, block counts in summary)
 Tests 35-41 : Consecutive windows — scheduler, prefetch, resolution
 Tests 42-46 : PTB and window audit fields
+Tests 47-52 : PTB hardening — SSR context anchor, delta guard, retry, Chainlink last resort
 """
 from __future__ import annotations
 
@@ -27,10 +28,11 @@ from bot.m5_session import (
     M5Session,
     M5SignalState,
     PaperFillResult,
+    PtbResult,
     fetch_ptb,
     fetch_ptb_ssr,
     fetch_ptb_api,
-    fetch_ptb_full,
+    fetch_ptb_robust,
     fetch_close_price,
 )
 
@@ -110,9 +112,21 @@ def _make_session(
 # Tests 1-3: PTB fetching
 # ---------------------------------------------------------------------------
 
+def _ssr_html(window_ts: int, open_price: str) -> str:
+    """Realistic SSR HTML: includes slug anchor and is > 500 chars."""
+    slug = f"btc-updown-5m-{window_ts}"
+    body = (
+        f'<!DOCTYPE html><html><head><title>BTC UP/DOWN 5m</title></head><body>'
+        f'<script id="__NEXT_DATA__">{{"props":{{"pageProps":{{"event":{{'
+        f'"slug":"{slug}","openPrice":"{open_price}","closePrice":null}}}}}}}}'
+        f'</script></body></html>'
+    )
+    return body + " " * max(0, 520 - len(body))
+
+
 def test_ptb_ssr_ok():
-    """SSR page contains openPrice — parsed correctly."""
-    html = '<script id="__NEXT_DATA__">{"openPrice": "84123.45"}</script>'
+    """SSR page contains slug-anchored openPrice — parsed correctly."""
+    html = _ssr_html(1_000_000, "84123.45")
     http = _make_http({"/event/btc-updown-5m-": {"status": 200, "text": html}})
     ptb, source = asyncio.run(fetch_ptb(http, 1_000_000, polymarket_base_url="https://fake"))
     assert ptb == pytest.approx(84123.45)
@@ -906,37 +920,45 @@ def test_window_audit_event_slug_derived_from_window_ts():
     assert record.event_slug == f"btc-updown-5m-{window_ts}"
 
 
-def test_fetch_ptb_full_ssr_takes_priority():
-    """fetch_ptb_full returns SSR value as primary when both SSR and API are available."""
+def test_fetch_ptb_robust_ssr_takes_priority_within_delta():
+    """fetch_ptb_robust selects SSR when both present and |delta| <= threshold."""
+    wts = 1_746_000_000
     ssr_price = 84000.0
-    api_price = 84050.0
+    api_price = 84005.0   # delta = 5 <= default 10.0
     http = _make_http({
-        "/event/btc-updown-5m-": {"status": 200, "text": f'{{"openPrice": "{ssr_price}"}}'},
+        "/event/btc-updown-5m-": {"status": 200, "text": _ssr_html(wts, str(ssr_price))},
         "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": str(api_price)}},
     })
-    ptb, source, ptb_ssr, ptb_api, ptb_cl = asyncio.run(
-        fetch_ptb_full(http, 1_746_000_000, polymarket_base_url="https://fake")
+    r = asyncio.run(
+        fetch_ptb_robust(http, wts, polymarket_base_url="https://fake",
+                         ptb_max_attempts=1, ptb_retry_delay_s=0.0)
     )
-    assert source == "ssr"
-    assert ptb == pytest.approx(ssr_price)
-    assert ptb_ssr == pytest.approx(ssr_price)
-    assert ptb_api == pytest.approx(api_price)
-    assert ptb_cl is None
+    assert r.source == "ssr"
+    assert r.ptb == pytest.approx(ssr_price)
+    assert r.ptb_ssr == pytest.approx(ssr_price)
+    assert r.ptb_api == pytest.approx(api_price)
+    assert r.ptb_ssr_rejected_for_delta is False
+    assert r.ptb_ssr_valid is True
+    assert r.ptb_api_valid is True
 
 
-def test_fetch_ptb_full_delta_sign():
-    """fetch_ptb_full returns correct raw ssr/api values for delta calculation."""
+def test_fetch_ptb_robust_raw_values_for_delta():
+    """fetch_ptb_robust exposes raw ssr/api so caller can compute delta."""
+    wts = 1_746_000_000
     ssr_price = 84000.0
-    api_price = 84100.0
+    api_price = 84100.0   # delta = 100 > threshold → SSR rejected
     http = _make_http({
-        "/event/btc-updown-5m-": {"status": 200, "text": f'{{"openPrice": "{ssr_price}"}}'},
+        "/event/btc-updown-5m-": {"status": 200, "text": _ssr_html(wts, str(ssr_price))},
         "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": str(api_price)}},
     })
-    _ptb, _src, ptb_ssr, ptb_api, _cl = asyncio.run(
-        fetch_ptb_full(http, 1_746_000_000, polymarket_base_url="https://fake")
+    r = asyncio.run(
+        fetch_ptb_robust(http, wts, polymarket_base_url="https://fake",
+                         ptb_max_attempts=1, ptb_retry_delay_s=0.0,
+                         ptb_max_ssr_api_delta_usd=10.0)
     )
-    delta = round(ptb_ssr - ptb_api, 2)
-    assert delta == pytest.approx(-100.0)
+    assert r.ptb_ssr == pytest.approx(ssr_price)
+    assert r.ptb_api == pytest.approx(api_price)
+    assert round(r.ptb_ssr - r.ptb_api, 2) == pytest.approx(-100.0)
 
 
 def test_resolution_audit_fields_stored_on_record():
@@ -974,3 +996,121 @@ def test_resolution_audit_fields_stored_on_record():
     assert record.entry_side == "up"  # sanity: entry did happen
     assert record.resolution_close_price_api == pytest.approx(close_p)
     assert record.resolution_open_price_api == pytest.approx(open_p)
+
+
+# ---------------------------------------------------------------------------
+# Tests 47-52 : PTB hardening — SSR context anchor, delta guard, retry
+# ---------------------------------------------------------------------------
+
+def test_ssr_extracts_open_price_with_slug_anchor():
+    """fetch_ptb_ssr returns openPrice when slug anchor is present in HTML."""
+    wts = 1_746_000_300
+    html = _ssr_html(wts, "84500.0")
+    http = _make_http({"/event/btc-updown-5m-": {"status": 200, "text": html}})
+    val = asyncio.run(fetch_ptb_ssr(http, wts, "https://fake"))
+    assert val == pytest.approx(84500.0)
+
+
+def test_ssr_rejects_open_price_without_anchor():
+    """fetch_ptb_ssr returns None when openPrice exists but no slug/ISO anchor present."""
+    # HTML contains openPrice but NOT the expected slug — global match rejected
+    html = '{"openPrice": "84500.0", "someOtherMarket": true}' + " " * 500
+    http = _make_http({"/event/btc-updown-5m-": {"status": 200, "text": html}})
+    val = asyncio.run(fetch_ptb_ssr(http, 1_746_000_300, "https://fake"))
+    assert val is None
+
+
+def test_ssr_rejects_short_html():
+    """fetch_ptb_ssr returns None when HTML is below minimum length."""
+    html = '<html><body>{"openPrice": "84000.0"}</body></html>'  # < 500 chars
+    assert len(html) < 500
+    http = _make_http({"/event/btc-updown-5m-": {"status": 200, "text": html}})
+    val = asyncio.run(fetch_ptb_ssr(http, 1_000_000, "https://fake"))
+    assert val is None
+
+
+def test_ptb_robust_rejects_ssr_on_large_delta():
+    """When |ssr - api| > threshold, API is selected and ptb_ssr_rejected_for_delta=True."""
+    wts = 1_746_000_000
+    ssr_price = 84000.0
+    api_price = 85000.0   # delta = 1000 >> 10.0
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 200, "text": _ssr_html(wts, str(ssr_price))},
+        "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": str(api_price)}},
+    })
+    r = asyncio.run(
+        fetch_ptb_robust(http, wts, polymarket_base_url="https://fake",
+                         ptb_max_attempts=1, ptb_retry_delay_s=0.0,
+                         ptb_max_ssr_api_delta_usd=10.0)
+    )
+    assert r.source == "api"
+    assert r.ptb == pytest.approx(api_price)
+    assert r.ptb_ssr_rejected_for_delta is True
+    assert r.ptb_ssr_valid is True
+    assert r.ptb_api_valid is True
+
+
+def test_ptb_robust_uses_api_when_ssr_absent():
+    """When SSR is absent (404), API is selected without delta check."""
+    wts = 1_746_000_000
+    api_price = 84750.0
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 404},
+        "/api/crypto/crypto-price": {"status": 200, "json": {"openPrice": str(api_price)}},
+    })
+    r = asyncio.run(
+        fetch_ptb_robust(http, wts, polymarket_base_url="https://fake",
+                         ptb_max_attempts=1, ptb_retry_delay_s=0.0)
+    )
+    assert r.source == "api"
+    assert r.ptb == pytest.approx(api_price)
+    assert r.ptb_ssr_valid is False
+    assert r.ptb_api_valid is True
+    assert r.ptb_ssr_rejected_for_delta is False
+
+
+def test_ptb_robust_chainlink_last_resort():
+    """When SSR and API both fail, Chainlink is used as last resort."""
+    wts = 1_746_000_000
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 404},
+        "/api/crypto/crypto-price": {"status": 500},
+    })
+    r = asyncio.run(
+        fetch_ptb_robust(
+            http, wts,
+            chainlink_price=84800.0, chainlink_age_s=10.0,
+            polymarket_base_url="https://fake",
+            ptb_max_attempts=1, ptb_retry_delay_s=0.0,
+        )
+    )
+    assert r.source == "chainlink"
+    assert r.ptb == pytest.approx(84800.0)
+    assert r.ptb_ssr_valid is False
+    assert r.ptb_api_valid is False
+
+
+def test_ptb_robust_skip_window_if_all_sources_fail():
+    """When all sources fail after all retries, ptb=None → session aborts."""
+    window_ts = 1_000_000
+    wts = window_ts
+    http = _make_http({
+        "/event/btc-updown-5m-": {"status": 404},
+        "/api/crypto/crypto-price": {"status": 500},
+    })
+    cfg = M5Config(
+        ptb_max_attempts=2,
+        ptb_retry_delay_s=0.0,
+    )
+    times = iter([wts + 15.1, wts + 15.2, wts + 15.3, wts + 15.4])
+    session = _make_session(
+        signal=M5SignalState(btc_price=85000.0),
+        http=http,
+        cfg=cfg,
+        time_fn=lambda: next(times, wts + 20.0),
+        prefetched_tokens=("up_tok", "dn_tok"),
+    )
+    record = asyncio.run(session.run(window_ts))
+    assert record.abort_reason == "ptb_unavailable"
+    assert record.ptb_attempts == 2
+    assert record.ptb is None
