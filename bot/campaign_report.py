@@ -59,6 +59,8 @@ class CampaignSummary:
     # Excluded counts (decisions where the field was None, so not bucketed)
     gap_bucket_excluded_count: int
     chainlink_age_bucket_excluded_count: int
+    # Gate reason breakdown: bid_reason → decision count across all sessions
+    by_bid_reason: dict
 
 
 def _bucket_label(value: float, thresholds: tuple) -> str:
@@ -217,6 +219,15 @@ def compute_campaign_summary(
     by_age = {label: _to_bucket_stats(samples) for label, samples in age_samples.items()}
     by_trigger = {label: _to_bucket_stats(samples) for label, samples in trigger_samples.items()}
 
+    # Gate reason counts: bid_reason from each decision event.
+    bid_reason_counts: dict[str, int] = {}
+    for ev in all_events:
+        if ev.get("event") != "decision":
+            continue
+        reason = ev.get("bid_reason")
+        if reason is not None:
+            bid_reason_counts[reason] = bid_reason_counts.get(reason, 0) + 1
+
     return CampaignSummary(
         session_count_requested=session_count_requested,
         session_count_completed=n,
@@ -243,4 +254,5 @@ def compute_campaign_summary(
         by_trigger=by_trigger,
         gap_bucket_excluded_count=gap_excluded,
         chainlink_age_bucket_excluded_count=age_excluded,
+        by_bid_reason=bid_reason_counts,
     )
