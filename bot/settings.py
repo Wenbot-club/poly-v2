@@ -81,6 +81,8 @@ class M5Config:
     ptb_retry_delay_s: float = 3.0
     # Reject SSR when |ssr - api| > this (USD); use API instead
     ptb_max_ssr_api_delta_usd: float = 10.0
+    # Reject PTB values below this floor (USD) — BTC: 50, ETH: 500
+    ptb_sanity_floor_usd: float = 50.0
     # Entry scan window [start, end)
     entry_scan_start_s: float = 140.0
     entry_scan_end_s: float = 170.0
@@ -117,3 +119,10 @@ class M5Config:
 
 
 DEFAULT_M5_CONFIG = M5Config()
+
+DEFAULT_ETH_M5_CONFIG = M5Config(
+    ptb_sanity_floor_usd=500.0,      # ETH > $500 sanity floor
+    ptb_max_ssr_api_delta_usd=5.0,   # tighter delta guard for ETH
+    sigma_floor_usd=3.0,             # ETH sigma can be lower in USD
+    hedge_threshold=2.0,             # ETH needs bigger PTB cross to hedge
+)

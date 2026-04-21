@@ -104,6 +104,8 @@ async def fetch_ptb_ssr(
     window_ts: int,
     base_url: str = _POLY_BASE,
     *,
+    asset: str = "btc",
+    ptb_sanity_floor: float = 50.0,
     min_html_len: int = 500,
 ) -> Optional[float]:
     """
@@ -113,7 +115,7 @@ async def fetch_ptb_ssr(
     openPrice that belongs to a different market/event is never picked up.
     Returns None when HTML is too short, no anchor found, or value fails sanity check.
     """
-    url = f"{base_url}/event/btc-updown-5m-{window_ts}"
+    url = f"{base_url}/event/{asset}-updown-5m-{window_ts}"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; polybot/1.0)"}
     try:
         async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -124,7 +126,7 @@ async def fetch_ptb_ssr(
                 return None
 
             # Anchors — try slug first, then ISO UTC variants
-            slug = f"btc-updown-5m-{window_ts}"
+            slug = f"{asset}-updown-5m-{window_ts}"
             dt = datetime.datetime.fromtimestamp(window_ts, tz=datetime.timezone.utc)
             iso_base = dt.strftime("%Y-%m-%dT%H:%M:%S")
             anchors = [slug, iso_base + "Z", iso_base + ".000Z", iso_base + "+00:00"]
@@ -137,7 +139,7 @@ async def fetch_ptb_ssr(
                 m = re.search(r'"openPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', context)
                 if m:
                     val = float(m.group(1))
-                    if val > 50.0:  # BTC price sanity floor
+                    if val > ptb_sanity_floor:
                         return val
     except Exception:
         pass
@@ -148,10 +150,12 @@ async def fetch_ptb_api(
     http: aiohttp.ClientSession,
     window_ts: int,
     base_url: str = _POLY_BASE,
+    *,
+    asset: str = "btc",
 ) -> Optional[float]:
     """Fetch openPrice from Polymarket crypto-price API."""
     url = f"{base_url}/api/crypto/crypto-price"
-    params = {"symbol": "BTC", "eventStartTime": window_ts, "variant": "fiveminute"}
+    params = {"symbol": asset.upper(), "eventStartTime": window_ts, "variant": "fiveminute"}
     try:
         async with http.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
@@ -215,6 +219,8 @@ async def fetch_ptb_robust(
     chainlink_price: Optional[float] = None,
     chainlink_age_s: Optional[float] = None,
     *,
+    asset: str = "btc",
+    ptb_sanity_floor: float = 50.0,
     polymarket_base_url: str = _POLY_BASE,
     chainlink_max_age_s: float = 60.0,
     ptb_max_attempts: int = 10,
@@ -244,8 +250,9 @@ async def fetch_ptb_robust(
     ptb_api_last: Optional[float] = None
 
     for attempt in range(1, ptb_max_attempts + 1):
-        ptb_ssr = await fetch_ptb_ssr(http, window_ts, polymarket_base_url)
-        ptb_api = await fetch_ptb_api(http, window_ts, polymarket_base_url)
+        ptb_ssr = await fetch_ptb_ssr(http, window_ts, polymarket_base_url,
+                                      asset=asset, ptb_sanity_floor=ptb_sanity_floor)
+        ptb_api = await fetch_ptb_api(http, window_ts, polymarket_base_url, asset=asset)
         ptb_ssr_last = ptb_ssr
         ptb_api_last = ptb_api
 
@@ -321,9 +328,11 @@ async def fetch_m5_tokens(
     http: aiohttp.ClientSession,
     window_ts: int,
     gamma_base_url: str = _GAMMA_BASE,
+    *,
+    asset: str = "btc",
 ) -> Optional[tuple]:  # (up_token_id, down_token_id) or None
     """Return (up_token_id, down_token_id) for the M5 window, or None."""
-    slug = f"btc-updown-5m-{window_ts}"
+    slug = f"{asset}-updown-5m-{window_ts}"
     url = f"{gamma_base_url}/events/slug/{slug}"
     try:
         async with http.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -468,6 +477,7 @@ class M5Session:
         prefetched_tokens: Optional[tuple] = None,
         token_prices: Optional[dict] = None,
         order_executor: Optional[Callable[[str, float, float], Awaitable["PaperFillResult"]]] = None,
+        asset: str = "btc",
     ) -> None:
         self._http = http_session
         self._signals = signal_state
@@ -476,6 +486,7 @@ class M5Session:
         self._gamma_url = gamma_base_url
         self._clob_url = clob_base_url
         self._poly_url = polymarket_base_url
+        self._asset = asset
 
         # External token price cache injected by caller (e.g. WS stream).
         # If provided the internal HTTP poller is skipped for that window.
@@ -507,7 +518,7 @@ class M5Session:
         record.window_end_utc_iso = wend.isoformat()
         record.window_start_local_iso = datetime.datetime.fromtimestamp(window_ts).isoformat()
         record.window_end_local_iso = datetime.datetime.fromtimestamp(window_ts + ws).isoformat()
-        record.event_slug = f"btc-updown-5m-{window_ts}"
+        record.event_slug = f"{self._asset}-updown-5m-{window_ts}"
 
         # Phase 1: wait until PTB fetch is safe
         await self._sleep_until(window_ts + self._cfg.ptb_fetch_delay_s)
@@ -520,6 +531,8 @@ class M5Session:
 
         pr = await fetch_ptb_robust(
             self._http, window_ts, cl_price, cl_age_s,
+            asset=self._asset,
+            ptb_sanity_floor=self._cfg.ptb_sanity_floor_usd,
             polymarket_base_url=self._poly_url,
             ptb_max_attempts=self._cfg.ptb_max_attempts,
             ptb_retry_delay_s=self._cfg.ptb_retry_delay_s,
@@ -555,7 +568,8 @@ class M5Session:
             tokens = self._prefetched_tokens
             record.used_prefetched_tokens = True
         else:
-            tokens = await fetch_m5_tokens(self._http, window_ts, self._gamma_url)
+            tokens = await fetch_m5_tokens(self._http, window_ts, self._gamma_url,
+                                           asset=self._asset)
         if tokens is None:
             record.abort_reason = "tokens_unavailable"
             return record
@@ -582,7 +596,8 @@ class M5Session:
 
         # Launch prefetch for next window (runs concurrently with settlement wait)
         self.next_tokens_task = asyncio.create_task(
-            fetch_m5_tokens(self._http, window_ts + self._cfg.window_seconds, self._gamma_url)
+            fetch_m5_tokens(self._http, window_ts + self._cfg.window_seconds,
+                            self._gamma_url, asset=self._asset)
         )
 
         # Phase 8: settlement — fetch_close_price handles the window_end wait internally
