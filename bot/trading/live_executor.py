@@ -10,6 +10,7 @@ Returns PaperFillResult for drop-in compatibility with the paper path.
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -60,7 +61,8 @@ class LiveOrderExecutor:
 
         # Use a high cap so the FOK always fills at whatever ask is available.
         order_price = self._MARKET_PRICE_CAP
-        shares = round(usd_bet / order_price, 4) if order_price > 0 else 0.0
+        # ceil to 4 dp so makerAmount = price*shares >= usd_bet (min order is $1)
+        shares = math.ceil(usd_bet / order_price * 1e4) / 1e4 if order_price > 0 else 0.0
         try:
             return await asyncio.to_thread(
                 self._post_fok, token_id, order_price, shares, price
