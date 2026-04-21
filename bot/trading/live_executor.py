@@ -31,6 +31,11 @@ class LiveOrderExecutor:
         from py_clob_client.clob_types import ApiCreds
         from py_clob_client.constants import POLYGON
 
+        # When the signer (MetaMask EOA) and the funder are the same address,
+        # the account is a plain EOA — don't pass funder so py-clob-client
+        # uses signatureType=0.  When they differ the funder is a Polymarket
+        # proxy and signatureType=1 is used automatically.
+        same = creds.signer_address.lower() == creds.funder_address.lower()
         self._client = ClobClient(
             host="https://clob.polymarket.com",
             key="0x" + creds.private_key.removeprefix("0x"),
@@ -40,7 +45,7 @@ class LiveOrderExecutor:
                 api_secret=creds.api_secret,
                 api_passphrase=creds.api_passphrase,
             ),
-            funder=creds.funder_address,
+            **({} if same else {"funder": creds.funder_address}),
         )
 
     _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap

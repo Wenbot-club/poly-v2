@@ -88,7 +88,7 @@ class M5Config:
     # Probabilistic entry model
     sigma_lookback_s: float = 60.0
     sigma_floor_usd: float = 5.0
-    z_gap_min: float = 0.35
+    z_gap_min: float = 0.0
     p_enter_up_min: float = 0.60
     p_enter_down_max: float = 0.40
     min_entry_edge: float = 0.06
