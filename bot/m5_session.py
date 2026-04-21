@@ -762,6 +762,7 @@ class M5Session:
         record.entry_submit_ts_ms = int(self._time_fn() * 1000)
         self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
+            record.entry_block_reason = fill.reject_reason
             return False
 
         record.entry_mode = "baseline"
