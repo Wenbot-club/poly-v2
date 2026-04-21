@@ -45,6 +45,22 @@ class LiveOrderExecutor:
 
     _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
 
+    async def prewarm(self, *token_ids: str) -> None:
+        """
+        Prime the internal caches (neg_risk, tick_size) for the given tokens.
+
+        Call this ahead of entry so the hot path skips ~300ms of HTTP fetches.
+        Runs in a thread so we don't block the event loop; errors are swallowed.
+        """
+        def _warm():
+            for tid in token_ids:
+                try:
+                    self._client.get_neg_risk(tid)
+                    self._client.get_tick_size(tid)
+                except Exception:
+                    pass
+        await asyncio.to_thread(_warm)
+
     async def __call__(
         self,
         token_id: str,

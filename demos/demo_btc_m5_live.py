@@ -219,6 +219,11 @@ async def run_campaign_live(
                     ws_price_task = asyncio.create_task(
                         _stream_token_prices_ws(http, [up_id, down_id], token_prices)
                     )
+                    # Pre-warm the executor's internal caches (neg_risk, tick_size)
+                    # in parallel while we wait for the entry trigger.  Saves
+                    # ~300ms of HTTP fetches at order submit time.
+                    if order_executor is not None and hasattr(order_executor, "prewarm"):
+                        asyncio.create_task(order_executor.prewarm(up_id, down_id))
                     # Give the WS book snapshot time to arrive before session starts
                     await asyncio.sleep(0.5)
 
