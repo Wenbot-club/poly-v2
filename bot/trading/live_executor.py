@@ -96,14 +96,16 @@ class LiveOrderExecutor:
         resp = self._client.post_order(signed, OrderType.FOK)
 
         success = bool(resp.get("success", False))
-        fill_price = float(resp.get("price", observed_ask)) if success else None
-        fill_shares = float(resp.get("size_matched", 0)) if success else None
+        making = float(resp.get("makingAmount", 0)) if success else 0.0
+        taking = float(resp.get("takingAmount", 0)) if success else 0.0
+        fill_price = (making / taking) if (success and taking > 0) else None
+        fill_shares = taking if success else None
         return PaperFillResult(
             fill_price=fill_price,
             shares=fill_shares,
             observed_best_ask=observed_ask,
             attempted_price=order_price,
-            slippage=round(order_price - observed_ask, 6),
+            slippage=round((fill_price or order_price) - observed_ask, 6),
             retries=0,
             reject_reason=None if success else (resp.get("errorMsg") or "fok_rejected"),
         )
