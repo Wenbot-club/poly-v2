@@ -2,7 +2,7 @@
 Bootstrap orchestrator — full go/no-go check before live trading.
 
 Runs in order:
-  1. Geoblock check (Polymarket endpoints reachable from this machine/VPS)
+  1. Geoblock check (GET /api/geoblock — official Polymarket eligibility API)
   2. Credential loading (env vars present and non-empty)
   3. CLOB dry-run (GET /profile — verifies API key works)
   4. On-chain approvals (USDC allowance + CTF/Neg Risk isApprovedForAll)
@@ -57,13 +57,17 @@ async def run_bootstrap(
     async def _run(http: aiohttp.ClientSession) -> None:
         # --- Step 1: Geoblock ---
         report.geoblock = await check_geoblock(session=http)
-        if not report.geoblock.all_reachable:
-            for name in report.geoblock.blocked_endpoints:
-                s = report.geoblock.endpoints[name]
-                report.issues.append(
-                    f"geoblock: {name} ({s.url}) unreachable"
-                    + (f" — {s.error}" if s.error else f" — HTTP {s.status_code}")
-                )
+        if not report.geoblock.eligible:
+            if report.geoblock.error:
+                report.issues.append(f"geoblock: {report.geoblock.error}")
+            else:
+                loc = ""
+                if report.geoblock.ip:
+                    loc = f" (ip={report.geoblock.ip}"
+                    if report.geoblock.country:
+                        loc += f", country={report.geoblock.country}"
+                    loc += ")"
+                report.issues.append(f"geoblock: this IP is blocked by Polymarket{loc}")
 
         # --- Step 2: Credentials ---
         try:
@@ -123,10 +127,19 @@ def print_bootstrap_report(report: BootstrapReport) -> None:
     # Geoblock
     if report.geoblock:
         print("\n  [geoblock]")
-        for name, status in report.geoblock.endpoints.items():
-            icon = "OK" if status.reachable else "BLOCKED"
-            detail = f"HTTP {status.status_code}" if status.status_code else status.error or ""
-            print(f"    {icon:8s}  {name}  ({detail})")
+        geo = report.geoblock
+        if geo.error:
+            print(f"    ERROR  {geo.error}")
+        elif geo.eligible:
+            parts = f"ip={geo.ip}" if geo.ip else ""
+            if geo.country:
+                parts += f", country={geo.country}"
+            print(f"    OK     not blocked  ({parts})")
+        else:
+            parts = f"ip={geo.ip}" if geo.ip else ""
+            if geo.country:
+                parts += f", country={geo.country}"
+            print(f"    BLOCKED  ({parts})")
 
     # Credentials
     print("\n  [credentials]")

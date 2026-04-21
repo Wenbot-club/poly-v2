@@ -1,12 +1,12 @@
 """
-Bootstrap trading module tests — 20 tests.
+Bootstrap trading module tests — 23 tests.
 
-Tests 1-4   : GeoBlockResult helpers
+Tests 1-4   : GeoBlockResult (eligible property + /api/geoblock mock)
 Tests 5-7   : credentials.load_credentials
 Tests 8-10  : clob_client HMAC auth header construction
 Tests 11-12 : clob_client dry_run_clob (mocked HTTP)
-Tests 13-16 : approvals._encode_call + check_approvals (mocked RPC)
-Tests 17-20 : run_bootstrap orchestration (mocked all I/O)
+Tests 13-18 : approvals._encode_call + check_approvals (mocked RPC)
+Tests 19-23 : run_bootstrap orchestration (mocked all I/O)
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from bot.trading.approvals import (
 from bot.trading.bootstrap import BootstrapReport, run_bootstrap
 from bot.trading.clob_client import ClobAuthError, _build_hmac_headers, dry_run_clob
 from bot.trading.credentials import CredentialError, Credentials, load_credentials
-from bot.trading.geoblock import EndpointStatus, GeoBlockResult, check_geoblock
+from bot.trading.geoblock import GeoBlockResult, check_geoblock
 
 
 # ---------------------------------------------------------------------------
@@ -51,46 +51,40 @@ def _make_creds(**overrides) -> Credentials:
 
 
 # ---------------------------------------------------------------------------
-# Tests 1-4: GeoBlockResult helpers
+# Tests 1-4: GeoBlockResult — /api/geoblock API
 # ---------------------------------------------------------------------------
 
-def test_geo_all_reachable():
-    result = GeoBlockResult(endpoints={
-        "a": EndpointStatus(url="https://a.com", reachable=True, status_code=200),
-        "b": EndpointStatus(url="https://b.com", reachable=True, status_code=200),
-    })
-    assert result.all_reachable is True
-    assert result.blocked_endpoints == []
+def test_geo_eligible_when_not_blocked():
+    result = GeoBlockResult(blocked=False, ip="1.2.3.4", country="DE")
+    assert result.eligible is True
 
 
-def test_geo_one_blocked():
-    result = GeoBlockResult(endpoints={
-        "a": EndpointStatus(url="https://a.com", reachable=True, status_code=200),
-        "b": EndpointStatus(url="https://b.com", reachable=False, status_code=451),
-    })
-    assert result.all_reachable is False
-    assert "b" in result.blocked_endpoints
+def test_geo_not_eligible_when_blocked():
+    result = GeoBlockResult(blocked=True, ip="1.2.3.4", country="US")
+    assert result.eligible is False
 
 
-def test_geo_connection_error():
-    result = GeoBlockResult(endpoints={
-        "clob_api": EndpointStatus(
-            url="https://clob.polymarket.com",
-            reachable=False,
-            error="connection error: ...",
-        ),
-    })
-    assert result.all_reachable is False
+def test_geo_not_eligible_on_error():
+    result = GeoBlockResult(blocked=False, error="timeout reaching geoblock API")
+    assert result.eligible is False
 
 
-def test_geo_check_mocked(monkeypatch):
-    """check_geoblock returns correct result for mocked HTTP responses."""
-    async def _fake_check(sess, name, url):
-        return name, EndpointStatus(url=url, reachable=True, status_code=200)
+def test_geo_check_mocked():
+    """check_geoblock parses /api/geoblock JSON response correctly."""
+    class _FakeResp:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def json(self, **kw):
+            return {"blocked": False, "ip": "9.9.9.9", "country": "NL", "region": "EU"}
 
-    monkeypatch.setattr("bot.trading.geoblock._check_endpoint", _fake_check)
-    result = asyncio.run(check_geoblock(endpoints={"test": "https://test.example"}))
-    assert result.all_reachable is True
+    class _FakeSess:
+        def get(self, *a, **kw): return _FakeResp()
+
+    result = asyncio.run(check_geoblock(session=_FakeSess()))
+    assert result.eligible is True
+    assert result.ip == "9.9.9.9"
+    assert result.country == "NL"
 
 
 # ---------------------------------------------------------------------------
@@ -267,15 +261,11 @@ def _patched_bootstrap(
     approvals_ready=True,
 ):
     """Helper: patch all I/O for bootstrap tests."""
-    from bot.trading.geoblock import EndpointStatus, GeoBlockResult
-
-    geo = GeoBlockResult(endpoints={
-        "polymarket_web": EndpointStatus(
-            url="https://polymarket.com",
-            reachable=geoblock_ok,
-            status_code=200 if geoblock_ok else 451,
-        ),
-    })
+    geo = GeoBlockResult(
+        blocked=not geoblock_ok,
+        ip="1.2.3.4",
+        country="NL" if geoblock_ok else "US",
+    )
 
     approval = ApprovalStatus(
         usdc_allowance_ctf=10_000_000 if approvals_ready else 0,
