@@ -43,6 +43,8 @@ class LiveOrderExecutor:
             funder=creds.funder_address,
         )
 
+    _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
+
     async def __call__(
         self,
         token_id: str,
@@ -51,35 +53,48 @@ class LiveOrderExecutor:
     ) -> "PaperFillResult":
         from bot.m5_session import PaperFillResult
 
-        shares = round(usd_bet / price, 4) if price > 0 else 0.0
+        # Use a high cap so the FOK always fills at whatever ask is available.
+        order_price = self._MARKET_PRICE_CAP
+        shares = round(usd_bet / order_price, 4) if order_price > 0 else 0.0
         try:
-            return await asyncio.to_thread(self._post_fok, token_id, price, shares)
+            return await asyncio.to_thread(
+                self._post_fok, token_id, order_price, shares, price
+            )
         except Exception as exc:
             return PaperFillResult(
                 fill_price=None,
                 shares=None,
                 observed_best_ask=price,
-                attempted_price=price,
+                attempted_price=order_price,
                 slippage=0.0,
                 retries=0,
                 reject_reason=str(exc)[:80],
             )
 
-    def _post_fok(self, token_id: str, price: float, size: float) -> "PaperFillResult":
+    def _post_fok(
+        self,
+        token_id: str,
+        order_price: float,
+        size: float,
+        observed_ask: float,
+    ) -> "PaperFillResult":
         from py_clob_client.clob_types import OrderArgs, OrderType
         from bot.m5_session import PaperFillResult
 
-        order_args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
+        order_args = OrderArgs(token_id=token_id, price=order_price, size=size, side="BUY")
         signed = self._client.create_order(order_args)
         resp = self._client.post_order(signed, OrderType.FOK)
 
         success = bool(resp.get("success", False))
+        # Actual fill price comes from the response; fall back to observed ask.
+        fill_price = float(resp.get("price", observed_ask)) if success else None
+        fill_shares = float(resp.get("size_matched", size)) if success else None
         return PaperFillResult(
-            fill_price=price if success else None,
-            shares=size if success else None,
-            observed_best_ask=price,
-            attempted_price=price,
-            slippage=0.0,
+            fill_price=fill_price,
+            shares=fill_shares,
+            observed_best_ask=observed_ask,
+            attempted_price=order_price,
+            slippage=round(order_price - observed_ask, 6),
             retries=0,
             reject_reason=None if success else (resp.get("errorMsg") or "fok_rejected"),
         )
