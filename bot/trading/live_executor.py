@@ -57,6 +57,10 @@ class LiveOrderExecutor:
         usd_bet: float,
     ) -> "PaperFillResult":
         from bot.m5_session import PaperFillResult
+        import time as _time
+
+        with open("/tmp/live_exec.log", "a") as _f:
+            _f.write(f"{_time.strftime('%H:%M:%S')} __call__ token={token_id} price={price} usd_bet={usd_bet}\n")
 
         order_price = self._MARKET_PRICE_CAP
         try:
@@ -64,6 +68,8 @@ class LiveOrderExecutor:
                 self._post_fok, token_id, order_price, usd_bet, price
             )
         except Exception as exc:
+            with open("/tmp/live_exec.log", "a") as _f:
+                _f.write(f"  __call__ EXC: {type(exc).__name__}: {exc}\n")
             return PaperFillResult(
                 fill_price=None,
                 shares=None,
