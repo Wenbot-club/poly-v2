@@ -45,7 +45,7 @@ class LiveOrderExecutor:
                 api_secret=creds.api_secret,
                 api_passphrase=creds.api_passphrase,
             ),
-            **({} if same else {"funder": creds.funder_address}),
+            **({} if same else {"funder": creds.funder_address, "signature_type": 1}),
         )
 
     _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
