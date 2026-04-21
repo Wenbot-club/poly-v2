@@ -320,14 +320,15 @@ def _print_record(record: TradeRecord) -> None:
           f"  pnl_hedge={record.pnl_hedge}  net={record.net_pnl}")
 
     # Per-order latency inline
+    # tick_age = ms since last received BTC price; submit = order round-trip ms
     if record.entry_decision_ts_ms and record.entry_tick_ts_ms:
-        d_ms = record.entry_decision_ts_ms - record.entry_tick_ts_ms
+        tick_age = record.entry_decision_ts_ms - record.entry_tick_ts_ms
         s_ms = (record.entry_submit_ts_ms or record.entry_decision_ts_ms) - record.entry_decision_ts_ms
-        print(f"  lat(entry): decision={d_ms}ms  submit={s_ms}ms")
+        print(f"  lat(entry): tick_age={tick_age}ms  submit={s_ms}ms")
     if record.hedged and record.hedge_decision_ts_ms and record.hedge_tick_ts_ms:
-        d_ms = record.hedge_decision_ts_ms - record.hedge_tick_ts_ms
+        tick_age = record.hedge_decision_ts_ms - record.hedge_tick_ts_ms
         s_ms = (record.hedge_submit_ts_ms or record.hedge_decision_ts_ms) - record.hedge_decision_ts_ms
-        print(f"  lat(hedge): decision={d_ms}ms  submit={s_ms}ms")
+        print(f"  lat(hedge): tick_age={tick_age}ms  submit={s_ms}ms")
 
 
 # ---------------------------------------------------------------------------

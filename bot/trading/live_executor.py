@@ -131,7 +131,7 @@ class LiveOrderExecutor:
                 signed = None
 
         if signed is None:
-            # Fallback: full sign+post on the hot path
+            print("[live] hedge presign=MISS — signing on hot path", flush=True)
             try:
                 return await asyncio.to_thread(
                     self._post_fok, token_id, order_price, usd_amount, observed_ask
@@ -143,6 +143,7 @@ class LiveOrderExecutor:
                     reject_reason=str(exc)[:200],
                 )
 
+        print("[live] hedge presign=HIT — skipping sign", flush=True)
         try:
             return await asyncio.to_thread(
                 self._post_presigned, signed, observed_ask, order_price
