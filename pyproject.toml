@@ -9,6 +9,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
     "eth-account>=0.10",
+    "uvloop>=0.19; sys_platform != 'win32'",
 ]
 
 [tool.setuptools.packages.find]

@@ -658,6 +658,8 @@ class M5Session:
 
         # HEDGE watch: only if LEG1 was taken
         if record.entry_side is not None:
+            # Pre-sign hedge order in background so the hot path only posts.
+            self._launch_hedge_presign(record.entry_side, up_id, down_id)
             await self._watch_for_hedge(record, ptb, up_id, down_id, window_ts, window_end_s)
 
     # ------------------------------------------------------------------
@@ -806,9 +808,13 @@ class M5Session:
                     if best_ask is not None:
                         record.hedge_tick_ts_ms = self._signals.btc_price_ts_ms
                         record.hedge_decision_ts_ms = int(self._time_fn() * 1000)
-                        fill = await self._execute_paper(
-                            token_id, best_ask, cfg.hedge_bet_usd, is_leg1=False
-                        )
+                        executor = self._order_executor
+                        if executor is not None and hasattr(executor, "post_presigned_hedge"):
+                            fill = await executor.post_presigned_hedge(best_ask)
+                        else:
+                            fill = await self._execute_paper(
+                                token_id, best_ask, cfg.hedge_bet_usd, is_leg1=False
+                            )
                         record.hedge_submit_ts_ms = int(self._time_fn() * 1000)
                         self._apply_fill_trace(record, fill, "hedge")
                         if fill.reject_reason is None:
@@ -821,6 +827,14 @@ class M5Session:
                             break
 
             await asyncio.sleep(0.2)
+
+    def _launch_hedge_presign(self, entry_side: str, up_id: str, down_id: str) -> None:
+        if self._order_executor is None or not hasattr(self._order_executor, "presign_hedge"):
+            return
+        hedge_token_id = down_id if entry_side == "up" else up_id
+        asyncio.create_task(
+            self._order_executor.presign_hedge(hedge_token_id, self._cfg.hedge_bet_usd)
+        )
 
     # ------------------------------------------------------------------
     # Paper execution

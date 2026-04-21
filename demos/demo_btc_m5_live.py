@@ -355,6 +355,12 @@ def main(argv=None) -> None:
         print("[paper] dry-run mode — no real orders", flush=True)
 
     try:
+        import uvloop  # type: ignore[import-untyped]
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
+
+    try:
         asyncio.run(run_campaign_live(args.windows, args.output_dir, order_executor=order_executor))
     except KeyboardInterrupt:
         print("\n[interrupted]")

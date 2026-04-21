@@ -50,6 +50,10 @@ class LiveOrderExecutor:
         )
         self._hot_until: float = 0.0
         self._heartbeat_task: Optional[asyncio.Task] = None
+        # Pre-sign state for hedge order
+        self._hedge_presign_task: Optional[asyncio.Task] = None
+        self._hedge_presign_token_id: Optional[str] = None
+        self._hedge_presign_usd: float = 0.0
 
     def start_heartbeat(self) -> None:
         """
@@ -84,6 +88,96 @@ class LiveOrderExecutor:
                 except Exception:
                     pass
         await asyncio.to_thread(_warm)
+
+    async def presign_hedge(self, token_id: str, usd_amount: float) -> None:
+        """
+        Pre-sign the hedge order right after entry fills.  Runs create_market_order
+        in a background thread so the hedge hot path only needs to call post_order.
+        """
+        self._hedge_presign_token_id = token_id
+        self._hedge_presign_usd = usd_amount
+        self._hedge_presign_task = asyncio.create_task(
+            asyncio.to_thread(self._do_presign, token_id, usd_amount)
+        )
+
+    def _do_presign(self, token_id: str, usd_amount: float) -> object:
+        from py_clob_client.clob_types import MarketOrderArgs
+        args = MarketOrderArgs(
+            token_id=token_id,
+            amount=usd_amount,
+            price=self._MARKET_PRICE_CAP,
+            side="BUY",
+        )
+        return self._client.create_market_order(args)
+
+    async def post_presigned_hedge(self, observed_ask: float) -> "PaperFillResult":
+        """
+        Post the hedge order using the pre-signed bytes when available.
+        Falls back to the full sign+post path if presign failed or wasn't done.
+        """
+        from bot.m5_session import PaperFillResult
+        from py_clob_client.clob_types import OrderType
+
+        self._hot_until = _time.time() + self._HOT_DURATION_S
+        order_price = self._MARKET_PRICE_CAP
+        token_id = self._hedge_presign_token_id or ""
+        usd_amount = self._hedge_presign_usd
+
+        signed = None
+        if self._hedge_presign_task is not None:
+            try:
+                signed = await self._hedge_presign_task
+            except Exception:
+                signed = None
+
+        if signed is None:
+            # Fallback: full sign+post on the hot path
+            try:
+                return await asyncio.to_thread(
+                    self._post_fok, token_id, order_price, usd_amount, observed_ask
+                )
+            except Exception as exc:
+                return PaperFillResult(
+                    fill_price=None, shares=None, observed_best_ask=observed_ask,
+                    attempted_price=order_price, slippage=0.0, retries=0,
+                    reject_reason=str(exc)[:200],
+                )
+
+        try:
+            return await asyncio.to_thread(
+                self._post_presigned, signed, observed_ask, order_price
+            )
+        except Exception as exc:
+            return PaperFillResult(
+                fill_price=None, shares=None, observed_best_ask=observed_ask,
+                attempted_price=order_price, slippage=0.0, retries=0,
+                reject_reason=str(exc)[:200],
+            )
+
+    def _post_presigned(
+        self,
+        signed: object,
+        observed_ask: float,
+        order_price: float,
+    ) -> "PaperFillResult":
+        from py_clob_client.clob_types import OrderType
+        from bot.m5_session import PaperFillResult
+
+        resp = self._client.post_order(signed, OrderType.FOK)
+        success = bool(resp.get("success", False))
+        making = float(resp.get("makingAmount", 0)) if success else 0.0
+        taking = float(resp.get("takingAmount", 0)) if success else 0.0
+        fill_price = (making / taking) if (success and taking > 0) else None
+        fill_shares = taking if success else None
+        return PaperFillResult(
+            fill_price=fill_price,
+            shares=fill_shares,
+            observed_best_ask=observed_ask,
+            attempted_price=order_price,
+            slippage=round((fill_price or order_price) - observed_ask, 6),
+            retries=0,
+            reject_reason=None if success else (resp.get("errorMsg") or "fok_rejected"),
+        )
 
     async def __call__(
         self,
