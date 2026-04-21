@@ -67,10 +67,9 @@ class LiveOrderExecutor:
 
     def _post_fok(self, token_id: str, price: float, size: float) -> "PaperFillResult":
         from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.constants import BUY
         from bot.m5_session import PaperFillResult
 
-        order_args = OrderArgs(token_id=token_id, price=price, size=size, side=BUY)
+        order_args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
         signed = self._client.create_order(order_args)
         resp = self._client.post_order(signed, OrderType.FOK)
 
