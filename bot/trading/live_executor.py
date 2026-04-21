@@ -19,23 +19,26 @@ if TYPE_CHECKING:
 
 class LiveOrderExecutor:
     """
-    One instance per trading session; ClobClient is created once on init.
+    One instance per trading session.
 
-    Usage:
-        executor = LiveOrderExecutor(creds)
-        fill = await executor(token_id, price, usd_bet)
+    A fresh ClobClient is created for every order because reusing a
+    long-lived client produced 'invalid signature' errors in the service
+    while identical one-shot scripts succeeded.
     """
 
     def __init__(self, creds: "Credentials") -> None:
+        self._creds = creds
+
+    _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
+
+    def _make_client(self):
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import ApiCreds
         from py_clob_client.constants import POLYGON
 
-        # signature_type: 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE.
-        # When signer == funder the account is a plain EOA (sig_type=0).
-        # Otherwise the funder is a Polymarket Gnosis Safe proxy (sig_type=2).
+        creds = self._creds
         same = creds.signer_address.lower() == creds.funder_address.lower()
-        self._client = ClobClient(
+        return ClobClient(
             host="https://clob.polymarket.com",
             key="0x" + creds.private_key.removeprefix("0x"),
             chain_id=POLYGON,
@@ -46,8 +49,6 @@ class LiveOrderExecutor:
             ),
             **({} if same else {"funder": creds.funder_address, "signature_type": 2}),
         )
-
-    _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
 
     async def __call__(
         self,
@@ -83,30 +84,17 @@ class LiveOrderExecutor:
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
         from bot.m5_session import PaperFillResult
 
-        # Use create_market_order (like the Node.js bot) so py-clob-client
-        # handles maker/taker amount precision correctly (maker: 2 decimals,
-        # taker: 4 decimals).
+        # Fresh client per order — the shared long-lived client in the service
+        # produced invalid_signature errors while one-shot scripts succeeded.
+        client = self._make_client()
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=usd_amount,
             price=order_price,
             side="BUY",
         )
-        import sys
-        print(f"[live_exec] token_id={token_id} amount={usd_amount} price={order_price} observed_ask={observed_ask}", file=sys.stderr, flush=True)
-        signed = self._client.create_market_order(order_args)
-        o = signed.order
-        try:
-            d = o.data_dict()
-            print(f"[live_exec] signed order: {d}", file=sys.stderr, flush=True)
-        except Exception:
-            pass
-        try:
-            resp = self._client.post_order(signed, OrderType.FOK)
-            print(f"[live_exec] post_order resp: {resp}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[live_exec] post_order EXCEPTION: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            raise
+        signed = client.create_market_order(order_args)
+        resp = client.post_order(signed, OrderType.FOK)
 
         success = bool(resp.get("success", False))
         making = float(resp.get("makingAmount", 0)) if success else 0.0
