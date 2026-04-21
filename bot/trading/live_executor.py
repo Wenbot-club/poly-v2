@@ -86,7 +86,7 @@ class LiveOrderExecutor:
         from py_clob_client.clob_types import OrderArgs, OrderType
         from bot.m5_session import PaperFillResult
 
-        order_args = OrderArgs(token_id=token_id, price=order_price, size=size, side="BUY", neg_risk=True)
+        order_args = OrderArgs(token_id=token_id, price=order_price, size=size, side="BUY")
         signed = self._client.create_order(order_args)
         resp = self._client.post_order(signed, OrderType.FOK)
 
