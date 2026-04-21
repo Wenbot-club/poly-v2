@@ -165,6 +165,7 @@ async def run_campaign_live(
     window_count: int,
     output_dir: Path,
     cfg: M5Config = DEFAULT_M5_CONFIG,
+    order_executor=None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     state = M5SignalState()
@@ -229,6 +230,7 @@ async def run_campaign_live(
                     btc_history=btc_history,
                     prefetched_tokens=prefetched,
                     token_prices=token_prices if prefetched is not None else None,
+                    order_executor=order_executor,
                 )
                 record = await session.run(wts)
                 trades.append(record)
@@ -326,10 +328,22 @@ def main(argv=None) -> None:
                         help="Number of M5 windows (default: 6)")
     parser.add_argument("--output-dir", type=Path, default=Path("m5_out_live"),
                         help="Output directory")
+    parser.add_argument("--live", action="store_true",
+                        help="Post real orders to Polymarket CLOB (default: paper)")
     args = parser.parse_args(argv)
 
+    order_executor = None
+    if args.live:
+        from bot.trading.live_executor import LiveOrderExecutor
+        from bot.trading.credentials import load_credentials
+        creds = load_credentials()
+        order_executor = LiveOrderExecutor(creds)
+        print("[!] LIVE MODE — real orders will be placed on Polymarket", flush=True)
+    else:
+        print("[paper] dry-run mode — no real orders", flush=True)
+
     try:
-        asyncio.run(run_campaign_live(args.windows, args.output_dir))
+        asyncio.run(run_campaign_live(args.windows, args.output_dir, order_executor=order_executor))
     except KeyboardInterrupt:
         print("\n[interrupted]")
 

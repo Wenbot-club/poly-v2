@@ -30,7 +30,7 @@ import re
 import time as _time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
@@ -467,6 +467,7 @@ class M5Session:
         btc_history: Optional[BtcHistory] = None,
         prefetched_tokens: Optional[tuple] = None,
         token_prices: Optional[dict] = None,
+        order_executor: Optional[Callable[[str, float, float], Awaitable["PaperFillResult"]]] = None,
     ) -> None:
         self._http = http_session
         self._signals = signal_state
@@ -488,6 +489,7 @@ class M5Session:
         self._price_insane_blocks: int = 0
         self._hedge_blocked_by_cutoff: bool = False
         self._prefetched_tokens = prefetched_tokens
+        self._order_executor = order_executor
         self.next_tokens_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
@@ -706,7 +708,7 @@ class M5Session:
 
         record.entry_tick_ts_ms = self._signals.btc_price_ts_ms
         record.entry_decision_ts_ms = int(self._time_fn() * 1000)
-        fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
+        fill = await self._execute_paper(token_id, best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
         record.entry_submit_ts_ms = int(self._time_fn() * 1000)
         self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
@@ -756,7 +758,7 @@ class M5Session:
 
         record.entry_tick_ts_ms = self._signals.btc_price_ts_ms
         record.entry_decision_ts_ms = int(self._time_fn() * 1000)
-        fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
+        fill = await self._execute_paper(token_id, best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
         record.entry_submit_ts_ms = int(self._time_fn() * 1000)
         self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
@@ -804,7 +806,7 @@ class M5Session:
                         record.hedge_tick_ts_ms = self._signals.btc_price_ts_ms
                         record.hedge_decision_ts_ms = int(self._time_fn() * 1000)
                         fill = await self._execute_paper(
-                            best_ask, cfg.hedge_bet_usd, is_leg1=False
+                            token_id, best_ask, cfg.hedge_bet_usd, is_leg1=False
                         )
                         record.hedge_submit_ts_ms = int(self._time_fn() * 1000)
                         self._apply_fill_trace(record, fill, "hedge")
@@ -825,19 +827,18 @@ class M5Session:
 
     async def _execute_paper(
         self,
+        token_id: str,
         best_ask: float,
         usd_bet: float,
         is_leg1: bool,
     ) -> PaperFillResult:
         """
-        Simulates FOK order. Fills at best_ask.
-        LIMITATION: no partial fills, no FAK retries in paper mode.
-        In real trading the attempted_price (best_ask + offset) would be sent
-        to the exchange; here it is only traced for slippage analysis.
+        Execute an order: routes to the real CLOB if order_executor is set,
+        otherwise simulates a FOK fill at best_ask (paper mode).
         """
         cfg = self._cfg
 
-        # price_insane guard: refuse before any offset logic
+        # price_insane guard: applies to both paper and live
         if best_ask >= cfg.price_insane_threshold:
             self._price_insane_blocks += 1
             return PaperFillResult(
@@ -853,9 +854,11 @@ class M5Session:
         fok_max = cfg.fok_max_price_leg1 if is_leg1 else cfg.fak_max_price
         attempted_price = min(best_ask + fok_offset, fok_max)
 
+        if self._order_executor is not None:
+            return await self._order_executor(token_id, attempted_price, usd_bet)
+
         fill_price = best_ask
         shares = usd_bet / fill_price if fill_price > 0 else 0.0
-
         return PaperFillResult(
             fill_price=fill_price,
             shares=round(shares, 8),

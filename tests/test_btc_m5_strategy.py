@@ -444,7 +444,7 @@ def test_hedge_blocked_after_cutoff():
 def test_price_insane_blocks_buy():
     """best_ask >= price_insane_threshold → reject_reason='price_insane'."""
     session = _make_session(cfg=M5Config(price_insane_threshold=0.995))
-    result = asyncio.run(session._execute_paper(best_ask=0.995, usd_bet=1.0, is_leg1=True))
+    result = asyncio.run(session._execute_paper("tok_insane", best_ask=0.995, usd_bet=1.0, is_leg1=True))
     assert result.reject_reason == "price_insane"
     assert result.fill_price is None
     assert session._price_insane_blocks == 1
@@ -453,7 +453,7 @@ def test_price_insane_blocks_buy():
 def test_price_just_below_insane_fills():
     """best_ask = 0.994 < 0.995 → fills normally."""
     session = _make_session(cfg=M5Config(price_insane_threshold=0.995))
-    result = asyncio.run(session._execute_paper(best_ask=0.994, usd_bet=1.0, is_leg1=True))
+    result = asyncio.run(session._execute_paper("tok_below", best_ask=0.994, usd_bet=1.0, is_leg1=True))
     assert result.reject_reason is None
     assert result.fill_price == pytest.approx(0.994)
 
