@@ -55,7 +55,7 @@ echo "→ Creating virtualenv..."
 python3.11 -m venv "$VENV"
 echo "→ Installing Python dependencies..."
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
+"$VENV/bin/pip" install --quiet "$INSTALL_DIR"
 ok "Python environment ready"
 
 # ── 4. Log directory ──────────────────────────────────────────────────────────
