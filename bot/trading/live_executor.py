@@ -10,7 +10,6 @@ Returns PaperFillResult for drop-in compatibility with the paper path.
 from __future__ import annotations
 
 import asyncio
-import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -47,7 +46,6 @@ class LiveOrderExecutor:
             ),
             **({} if same else {"funder": creds.funder_address, "signature_type": 2}),
         )
-        self._approved_tokens: set[str] = set()
 
     _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
 
@@ -59,13 +57,10 @@ class LiveOrderExecutor:
     ) -> "PaperFillResult":
         from bot.m5_session import PaperFillResult
 
-        # Use a high cap so the FOK always fills at whatever ask is available.
         order_price = self._MARKET_PRICE_CAP
-        # ceil to 4 dp so makerAmount = price*shares >= usd_bet (min order is $1)
-        shares = math.ceil(usd_bet / order_price * 1e4) / 1e4 if order_price > 0 else 0.0
         try:
             return await asyncio.to_thread(
-                self._post_fok, token_id, order_price, shares, price
+                self._post_fok, token_id, order_price, usd_bet, price
             )
         except Exception as exc:
             return PaperFillResult(
@@ -75,37 +70,34 @@ class LiveOrderExecutor:
                 attempted_price=order_price,
                 slippage=0.0,
                 retries=0,
-                reject_reason=str(exc)[:80],
+                reject_reason=str(exc)[:200],
             )
 
     def _post_fok(
         self,
         token_id: str,
         order_price: float,
-        size: float,
+        usd_amount: float,
         observed_ask: float,
     ) -> "PaperFillResult":
-        from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
         from bot.m5_session import PaperFillResult
 
-        # Approve conditional token once per session (required by CLOB before trading).
-        if token_id not in self._approved_tokens:
-            try:
-                self._client.update_balance_allowance(
-                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                )
-                self._approved_tokens.add(token_id)
-            except Exception:
-                pass
-
-        order_args = OrderArgs(token_id=token_id, price=order_price, size=size, side="BUY")
-        signed = self._client.create_order(order_args)
+        # Use create_market_order (like the Node.js bot) so py-clob-client
+        # handles maker/taker amount precision correctly (maker: 2 decimals,
+        # taker: 4 decimals).
+        order_args = MarketOrderArgs(
+            token_id=token_id,
+            amount=usd_amount,
+            price=order_price,
+            side="BUY",
+        )
+        signed = self._client.create_market_order(order_args)
         resp = self._client.post_order(signed, OrderType.FOK)
 
         success = bool(resp.get("success", False))
-        # Actual fill price comes from the response; fall back to observed ask.
         fill_price = float(resp.get("price", observed_ask)) if success else None
-        fill_shares = float(resp.get("size_matched", size)) if success else None
+        fill_shares = float(resp.get("size_matched", 0)) if success else None
         return PaperFillResult(
             fill_price=fill_price,
             shares=fill_shares,
