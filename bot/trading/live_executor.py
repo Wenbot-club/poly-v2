@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+print(">>> LIVE_EXEC MODULE IMPORTED <<<", flush=True)
+
 if TYPE_CHECKING:
     from bot.m5_session import PaperFillResult
     from bot.trading.credentials import Credentials
@@ -61,6 +63,7 @@ class LiveOrderExecutor:
 
         with open("/tmp/live_exec.log", "a") as _f:
             _f.write(f"{_time.strftime('%H:%M:%S')} __call__ token={token_id} price={price} usd_bet={usd_bet}\n")
+        print(f">>> LIVE_EXEC __call__ reached <<<", flush=True)
 
         order_price = self._MARKET_PRICE_CAP
         try:
