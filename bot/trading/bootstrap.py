@@ -4,7 +4,7 @@ Bootstrap orchestrator — full go/no-go check before live trading.
 Runs in order:
   1. Geoblock check (GET /api/geoblock — official Polymarket eligibility API)
   2. Credential loading (env vars present and non-empty)
-  3. CLOB dry-run (GET /profile — verifies API key works)
+  3. CLOB dry-run (GET /data/trades — verifies L2 API key works)
   4. On-chain approvals (USDC allowance + CTF/Neg Risk isApprovedForAll)
 
 Returns a BootstrapReport with a top-level `ready` flag and per-step details.

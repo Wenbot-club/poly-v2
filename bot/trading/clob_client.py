@@ -3,7 +3,7 @@ Minimal Polymarket CLOB REST client — L2 (API key) authentication only.
 
 Implements only the subset needed for bootstrap validation:
   - HMAC-SHA256 request signing (stdlib hmac + hashlib + base64)
-  - GET /profile — validates credentials are accepted by the API
+  - GET /data/trades — validates L2 credentials are accepted by the API
 
 No external dependencies beyond aiohttp (already in requirements.txt).
 
@@ -71,17 +71,18 @@ def _build_hmac_headers(
     }
 
 
-async def get_profile(
+async def get_trades(
     session: aiohttp.ClientSession,
     creds: Credentials,
-) -> dict[str, Any]:
+) -> Any:
     """
-    GET /profile — returns account profile dict on success.
+    GET /data/trades — returns the authenticated user's trade history.
 
-    Raises ClobAuthError on 401/403.
-    Raises ClobRequestError on other non-2xx responses.
+    Used as a read-only L2-auth validation endpoint: if auth is correct the
+    server returns 200 with a (possibly empty) list. Raises ClobAuthError on
+    401/403 and ClobRequestError on other non-2xx responses.
     """
-    path = "/profile"
+    path = "/data/trades"
     headers = _build_hmac_headers(creds, "GET", path)
 
     async with session.get(
@@ -102,14 +103,15 @@ async def dry_run_clob(
     creds: Credentials,
 ) -> dict[str, Any]:
     """
-    Validate CLOB credentials with a read-only GET /profile call.
+    Validate CLOB L2 credentials with a read-only GET /data/trades call.
 
-    Returns {"ok": True, "address": ..., "profile": {...}} on success.
+    Returns {"ok": True, "address": ..., "trade_count": N} on success.
     Returns {"ok": False, "error": "..."} on auth failure or network error.
     """
     try:
-        profile = await get_profile(session, creds)
-        return {"ok": True, "address": creds.funder_address, "profile": profile}
+        trades = await get_trades(session, creds)
+        count = len(trades) if isinstance(trades, list) else 0
+        return {"ok": True, "address": creds.funder_address, "trade_count": count}
     except ClobAuthError as e:
         return {"ok": False, "error": str(e)}
     except aiohttp.ClientError as e:
