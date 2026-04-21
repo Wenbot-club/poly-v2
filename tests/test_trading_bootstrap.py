@@ -117,10 +117,15 @@ def test_credentials_default_rpc():
 
 def test_hmac_headers_keys_present():
     creds = _make_creds()
-    headers = _build_hmac_headers(creds, "GET", "/profile", timestamp=1_700_000_000)
-    for key in ("POLY_ADDRESS", "POLY_SIGNATURE", "POLY_TIMESTAMP", "POLY_NONCE",
+    headers = _build_hmac_headers(creds, "GET", "/data/trades", timestamp=1_700_000_000)
+    for key in ("POLY_ADDRESS", "POLY_SIGNATURE", "POLY_TIMESTAMP",
                 "POLY_API_KEY", "POLY_PASSPHRASE"):
         assert key in headers
+    # POLY_NONCE is an L1-auth header; it MUST NOT be sent for L2 auth.
+    assert "POLY_NONCE" not in headers
+    # POLY_ADDRESS must be the signer (derived from private key), not the funder.
+    assert headers["POLY_ADDRESS"] == creds.signer_address
+    assert headers["POLY_ADDRESS"] != creds.funder_address
 
 
 def test_hmac_headers_timestamp_used():

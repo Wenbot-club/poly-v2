@@ -43,13 +43,16 @@ def _build_hmac_headers(
     path: str,
     body: str = "",
     timestamp: Optional[int] = None,
-    nonce: int = 0,
 ) -> dict[str, str]:
     """
     Build Polymarket L2 HMAC-SHA256 auth headers.
 
     Message = str(timestamp) + method.upper() + path + body
-    Signature = base64( HMAC-SHA256( base64decode(secret), message ) )
+    Signature = urlsafe_base64( HMAC-SHA256( urlsafe_b64decode(secret), message ) )
+
+    Matches py-clob-client's create_level_2_headers exactly — POLY_ADDRESS is
+    the EOA signer address (derived from the private key), not the funder.
+    No POLY_NONCE is sent for L2 auth.
     """
     ts = timestamp if timestamp is not None else int(time.time())
     message = f"{ts}{method.upper()}{path}{body}"
@@ -61,10 +64,9 @@ def _build_hmac_headers(
     signature = base64.urlsafe_b64encode(sig_bytes).decode()
 
     return {
-        "POLY_ADDRESS": creds.funder_address,
+        "POLY_ADDRESS": creds.signer_address,
         "POLY_SIGNATURE": signature,
         "POLY_TIMESTAMP": str(ts),
-        "POLY_NONCE": str(nonce),
         "POLY_API_KEY": creds.api_key,
         "POLY_PASSPHRASE": creds.api_passphrase,
         "Content-Type": "application/json",

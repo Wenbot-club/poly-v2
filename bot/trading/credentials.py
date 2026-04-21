@@ -40,13 +40,26 @@ class Credentials:
     api_key: str
     api_secret: str           # base64-encoded
     api_passphrase: str
-    funder_address: str       # checksummed or lowercase EVM address
+    funder_address: str       # checksummed or lowercase EVM address (USDC holder / proxy)
+    signer_address: str       # EOA address derived from private_key — used in POLY_ADDRESS
     rpc_url: str
 
     @property
     def private_key_hex(self) -> str:
         """Return private key without 0x prefix."""
         return self.private_key.removeprefix("0x")
+
+
+def _derive_signer_address(private_key_hex: str) -> str:
+    """Derive lowercase EVM address from a raw hex private key via eth_account."""
+    try:
+        from eth_account import Account
+    except ImportError as e:
+        raise CredentialError(
+            "eth_account is required to derive signer address from private key"
+        ) from e
+    pk = private_key_hex.removeprefix("0x").strip()
+    return Account.from_key("0x" + pk).address.lower()
 
 
 def load_credentials(env: Optional[dict[str, str]] = None) -> Credentials:
@@ -61,11 +74,13 @@ def load_credentials(env: Optional[dict[str, str]] = None) -> Credentials:
     if missing:
         raise CredentialError(f"Missing required env vars: {', '.join(missing)}")
 
+    private_key = source["POLY_PRIVATE_KEY"].strip()
     return Credentials(
-        private_key=source["POLY_PRIVATE_KEY"].strip(),
+        private_key=private_key,
         api_key=source["POLY_API_KEY"].strip(),
         api_secret=source["POLY_API_SECRET"].strip(),
         api_passphrase=source["POLY_API_PASSPHRASE"].strip(),
         funder_address=source["POLY_FUNDER_ADDRESS"].strip().lower(),
+        signer_address=_derive_signer_address(private_key),
         rpc_url=source.get("POLY_RPC_URL", _DEFAULT_RPC).strip() or _DEFAULT_RPC,
     )
