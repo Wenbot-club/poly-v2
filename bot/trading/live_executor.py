@@ -10,7 +10,8 @@ Returns PaperFillResult for drop-in compatibility with the paper path.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import time as _time
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from bot.m5_session import PaperFillResult
@@ -21,6 +22,11 @@ class LiveOrderExecutor:
     """
     One instance per trading session; ClobClient is created once on init.
     """
+
+    _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
+    _HEARTBEAT_IDLE_S = 15.0
+    _HEARTBEAT_HOT_S = 2.0
+    _HOT_DURATION_S = 150.0  # stay hot for ~one post-entry window
 
     def __init__(self, creds: "Credentials") -> None:
         from py_clob_client.client import ClobClient
@@ -42,8 +48,26 @@ class LiveOrderExecutor:
             ),
             **({} if same else {"funder": creds.funder_address, "signature_type": 2}),
         )
+        self._hot_until: float = 0.0
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
-    _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
+    def start_heartbeat(self) -> None:
+        """
+        Launch a background task that pings the CLOB periodically to keep
+        the TCP/TLS connection warm.  Rate is adaptive: 15s idle, 2s during
+        the ~150s post-entry critical window.
+        """
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            hot = _time.time() < self._hot_until
+            await asyncio.sleep(self._HEARTBEAT_HOT_S if hot else self._HEARTBEAT_IDLE_S)
+            try:
+                await asyncio.to_thread(self._client.get_ok)
+            except Exception:
+                pass
 
     async def prewarm(self, *token_ids: str) -> None:
         """
@@ -68,6 +92,9 @@ class LiveOrderExecutor:
         usd_bet: float,
     ) -> "PaperFillResult":
         from bot.m5_session import PaperFillResult
+
+        # Enter hot heartbeat mode so the connection stays warm for the hedge.
+        self._hot_until = _time.time() + self._HOT_DURATION_S
 
         order_price = self._MARKET_PRICE_CAP
         try:

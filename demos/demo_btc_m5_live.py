@@ -177,6 +177,10 @@ async def run_campaign_live(
         binance_task = asyncio.create_task(_update_binance_loop(http, state, btc_history))
         chainlink_task = asyncio.create_task(_update_chainlink_loop(http, state))
 
+        # Keep the CLOB TCP/TLS connection warm for live trading.
+        if order_executor is not None and hasattr(order_executor, "start_heartbeat"):
+            order_executor.start_heartbeat()
+
         # Brief warm-up for feeds before first window
         await asyncio.sleep(2.0)
 
