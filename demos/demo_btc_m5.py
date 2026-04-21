@@ -32,6 +32,7 @@ from typing import Optional
 
 import aiohttp
 
+from bot.m5_attribution import compute_attribution, export_attribution, print_attribution
 from bot.m5_session import M5Session, M5SignalState, BtcHistory, fetch_token_best_ask
 from bot.m5_summary import TradeRecord, aggregate_trades
 from bot.providers.binance_signal import BinanceSignalProvider
@@ -262,6 +263,12 @@ async def run_campaign(
     summary_path = output_dir / "m5_campaign_summary.json"
     with summary_path.open("w") as f:
         json.dump(dataclasses.asdict(summary), f, indent=2)
+
+    attribution = compute_attribution(trades)
+    print_attribution(attribution)
+    attribution_path = output_dir / "attribution.csv"
+    export_attribution(attribution, attribution_path)
+    print(f"  attribution → {attribution_path}")
 
     print(f"\n{'=' * 55}")
     print("  M5 Campaign summary")
