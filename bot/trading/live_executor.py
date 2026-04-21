@@ -92,8 +92,21 @@ class LiveOrderExecutor:
             price=order_price,
             side="BUY",
         )
+        import sys
+        print(f"[live_exec] token_id={token_id} amount={usd_amount} price={order_price} observed_ask={observed_ask}", file=sys.stderr, flush=True)
         signed = self._client.create_market_order(order_args)
-        resp = self._client.post_order(signed, OrderType.FOK)
+        o = signed.order
+        try:
+            d = o.data_dict()
+            print(f"[live_exec] signed order: {d}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        try:
+            resp = self._client.post_order(signed, OrderType.FOK)
+            print(f"[live_exec] post_order resp: {resp}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[live_exec] post_order EXCEPTION: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            raise
 
         success = bool(resp.get("success", False))
         making = float(resp.get("makingAmount", 0)) if success else 0.0
