@@ -54,9 +54,11 @@ def _build_hmac_headers(
     ts = timestamp if timestamp is not None else int(time.time())
     message = f"{ts}{method.upper()}{path}{body}"
 
-    secret_bytes = base64.b64decode(creds.api_secret)
+    # Polymarket returns URL-safe base64 secrets, sometimes without padding.
+    secret_padded = creds.api_secret + "=" * (-len(creds.api_secret) % 4)
+    secret_bytes = base64.urlsafe_b64decode(secret_padded)
     sig_bytes = hmac.new(secret_bytes, message.encode(), hashlib.sha256).digest()
-    signature = base64.b64encode(sig_bytes).decode()
+    signature = base64.urlsafe_b64encode(sig_bytes).decode()
 
     return {
         "POLY_ADDRESS": creds.funder_address,

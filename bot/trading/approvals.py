@@ -7,6 +7,7 @@ Uses raw JSON-RPC eth_call via aiohttp to check:
 
 Polygon contract addresses (mainnet):
   USDC (PoS):            0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+  ConditionalTokens:     0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
   CTF Exchange:          0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
   Neg Risk Exchange:     0xC5d563A36AE78145C45a50134d48A1215220f80a
   Neg Risk Adapter:      0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296
@@ -22,6 +23,7 @@ import aiohttp
 # --- Contract addresses (Polygon mainnet) ------------------------------------
 
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+CTF_TOKEN = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
@@ -119,14 +121,14 @@ async def check_approvals(
         raw_allowance = await _eth_call(session, rpc_url, USDC_ADDRESS, allowance_data)
         usdc_allowance = _decode_uint256(raw_allowance)
 
-        # 2. CTF isApprovedForAll: funder → Neg Risk Exchange
-        ctf_approval_data = _encode_call(_SEL_IS_APPROVED_FOR_ALL, funder, NEG_RISK_EXCHANGE)
-        raw_ctf = await _eth_call(session, rpc_url, CTF_EXCHANGE, ctf_approval_data)
+        # 2. ConditionalTokens isApprovedForAll: funder → CTF Exchange
+        ctf_approval_data = _encode_call(_SEL_IS_APPROVED_FOR_ALL, funder, CTF_EXCHANGE)
+        raw_ctf = await _eth_call(session, rpc_url, CTF_TOKEN, ctf_approval_data)
         ctf_approved = _decode_bool(raw_ctf)
 
-        # 3. Neg Risk isApprovedForAll: funder → Neg Risk Adapter
+        # 3. ConditionalTokens isApprovedForAll: funder → Neg Risk Adapter
         neg_risk_data = _encode_call(_SEL_IS_APPROVED_FOR_ALL, funder, NEG_RISK_ADAPTER)
-        raw_neg = await _eth_call(session, rpc_url, NEG_RISK_EXCHANGE, neg_risk_data)
+        raw_neg = await _eth_call(session, rpc_url, CTF_TOKEN, neg_risk_data)
         neg_approved = _decode_bool(raw_neg)
 
         return ApprovalStatus(
