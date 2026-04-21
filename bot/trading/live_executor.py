@@ -46,6 +46,7 @@ class LiveOrderExecutor:
             ),
             **({} if same else {"funder": creds.funder_address, "signature_type": 2}),
         )
+        self._approved_tokens: set[str] = set()
 
     _MARKET_PRICE_CAP = 0.99  # FOK limit — fills at best ask, up to this cap
 
@@ -82,8 +83,18 @@ class LiveOrderExecutor:
         size: float,
         observed_ask: float,
     ) -> "PaperFillResult":
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
         from bot.m5_session import PaperFillResult
+
+        # Approve conditional token once per session (required by CLOB before trading).
+        if token_id not in self._approved_tokens:
+            try:
+                self._client.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                )
+                self._approved_tokens.add(token_id)
+            except Exception:
+                pass
 
         order_args = OrderArgs(token_id=token_id, price=order_price, size=size, side="BUY")
         signed = self._client.create_order(order_args)
