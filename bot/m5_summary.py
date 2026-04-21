@@ -99,6 +99,14 @@ class TradeRecord:
     abort_reason: Optional[str] = None         # "ptb_unavailable" | "tokens_unavailable" | ...
     entry_block_reason: Optional[str] = None   # "noise_zone" | "edge_not_enough" | "probability_not_strong_enough" | ...
 
+    # Latency timestamps (epoch-ms, populated in live/paper-live mode)
+    entry_tick_ts_ms: Optional[int] = None     # btc_price_ts_ms at entry decision
+    entry_decision_ts_ms: Optional[int] = None # wall-clock when strategy decided to enter
+    entry_submit_ts_ms: Optional[int] = None   # wall-clock after paper fill
+    hedge_tick_ts_ms: Optional[int] = None     # btc_price_ts_ms at hedge trigger
+    hedge_decision_ts_ms: Optional[int] = None # wall-clock when hedge decided
+    hedge_submit_ts_ms: Optional[int] = None   # wall-clock after hedge paper fill
+
 
 @dataclass
 class M5CampaignSummary:

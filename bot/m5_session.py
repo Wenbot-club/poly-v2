@@ -466,6 +466,7 @@ class M5Session:
         polymarket_base_url: str = _POLY_BASE,
         btc_history: Optional[BtcHistory] = None,
         prefetched_tokens: Optional[tuple] = None,
+        token_prices: Optional[dict] = None,
     ) -> None:
         self._http = http_session
         self._signals = signal_state
@@ -475,7 +476,14 @@ class M5Session:
         self._clob_url = clob_base_url
         self._poly_url = polymarket_base_url
 
-        self._token_prices: dict = {}   # token_id → best_ask
+        # External token price cache injected by caller (e.g. WS stream).
+        # If provided the internal HTTP poller is skipped for that window.
+        if token_prices is not None:
+            self._token_prices: dict = token_prices
+            self._external_prices = True
+        else:
+            self._token_prices = {}
+            self._external_prices = False
         self._btc_history = btc_history if btc_history is not None else BtcHistory()
         self._price_insane_blocks: int = 0
         self._hedge_blocked_by_cutoff: bool = False
@@ -551,17 +559,20 @@ class M5Session:
             return record
         up_id, down_id = tokens
 
-        # Phase 4: start background token price polling
-        poll_task = asyncio.create_task(self._poll_token_prices(up_id, down_id))
-
+        # Phase 4: token prices — WS stream (external) or HTTP polling (fallback)
+        poll_task = (
+            None if self._external_prices
+            else asyncio.create_task(self._poll_token_prices(up_id, down_id))
+        )
         try:
             await self._trading_phases(record, pr.ptb, window_ts, up_id, down_id)
         finally:
-            poll_task.cancel()
-            try:
-                await poll_task
-            except asyncio.CancelledError:
-                pass
+            if poll_task is not None:
+                poll_task.cancel()
+                try:
+                    await poll_task
+                except asyncio.CancelledError:
+                    pass
 
         # Propagate session-level counters to record
         record.price_insane_block_count = self._price_insane_blocks
@@ -693,7 +704,10 @@ class M5Session:
             record.entry_block_reason = "no_token_price"
             return False
 
+        record.entry_tick_ts_ms = self._signals.btc_price_ts_ms
+        record.entry_decision_ts_ms = int(self._time_fn() * 1000)
         fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
+        record.entry_submit_ts_ms = int(self._time_fn() * 1000)
         self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
             record.entry_block_reason = fill.reject_reason
@@ -740,7 +754,10 @@ class M5Session:
             record.abort_reason = "baseline_no_price"
             return False
 
+        record.entry_tick_ts_ms = self._signals.btc_price_ts_ms
+        record.entry_decision_ts_ms = int(self._time_fn() * 1000)
         fill = await self._execute_paper(best_ask, self._cfg.leg1_bet_usd, is_leg1=True)
+        record.entry_submit_ts_ms = int(self._time_fn() * 1000)
         self._apply_fill_trace(record, fill, "leg1")
         if fill.reject_reason is not None:
             return False
@@ -784,9 +801,12 @@ class M5Session:
                     token_id = down_id if hedge_side == "down" else up_id
                     best_ask = self._token_prices.get(token_id)
                     if best_ask is not None:
+                        record.hedge_tick_ts_ms = self._signals.btc_price_ts_ms
+                        record.hedge_decision_ts_ms = int(self._time_fn() * 1000)
                         fill = await self._execute_paper(
                             best_ask, cfg.hedge_bet_usd, is_leg1=False
                         )
+                        record.hedge_submit_ts_ms = int(self._time_fn() * 1000)
                         self._apply_fill_trace(record, fill, "hedge")
                         if fill.reject_reason is None:
                             record.hedged = True

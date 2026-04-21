@@ -1,0 +1,25 @@
+[Unit]
+Description=BTC M5 paper-live runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/poly-v2
+ExecStart=/opt/poly-v2/.venv/bin/python demos/demo_btc_m5_live.py \
+    --windows 2016 \
+    --output-dir /opt/poly-v2/m5_out_live
+
+Restart=on-failure
+RestartSec=30
+
+# Stdout/stderr to a rolling log file — rotate externally with logrotate
+StandardOutput=append:/var/log/poly-v2/btc_m5.log
+StandardError=append:/var/log/poly-v2/btc_m5.log
+
+# Hard kill after 60s if graceful shutdown stalls
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
