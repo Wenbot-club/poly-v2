@@ -297,8 +297,11 @@ def _print_record(record: TradeRecord) -> None:
     if record.abort_reason:
         print(f"  ABORTED: {record.abort_reason}")
         return
-    print(f"  entry  : mode={record.entry_mode}  side={record.entry_side}"
-          f"  t={record.entry_elapsed_s:.1f}s  price={record.entry_price:.4f}")
+    if record.entry_mode is None:
+        print(f"  entry  : BLOCKED ({record.entry_block_reason})")
+    else:
+        print(f"  entry  : mode={record.entry_mode}  side={record.entry_side}"
+              f"  t={record.entry_elapsed_s:.1f}s  price={record.entry_price:.4f}")
     if record.hedged:
         print(f"  hedge  : side={record.hedge_side}  t={record.hedge_elapsed_s:.1f}s"
               f"  price={record.hedge_price:.4f}")
