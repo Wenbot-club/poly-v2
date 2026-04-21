@@ -83,6 +83,11 @@ class LiveOrderExecutor:
     ) -> "PaperFillResult":
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
         from bot.m5_session import PaperFillResult
+        import time as _time
+
+        # Log what we actually send to the CLOB
+        with open("/tmp/live_exec.log", "a") as _f:
+            _f.write(f"{_time.strftime('%H:%M:%S')} token={token_id} amount={usd_amount} price={order_price} ask={observed_ask}\n")
 
         # Fresh client per order — the shared long-lived client in the service
         # produced invalid_signature errors while one-shot scripts succeeded.
@@ -94,7 +99,21 @@ class LiveOrderExecutor:
             side="BUY",
         )
         signed = client.create_market_order(order_args)
-        resp = client.post_order(signed, OrderType.FOK)
+
+        with open("/tmp/live_exec.log", "a") as _f:
+            try:
+                _f.write(f"  signed: {signed.order.data_dict()}\n")
+            except Exception as e:
+                _f.write(f"  signed err: {e}\n")
+
+        try:
+            resp = client.post_order(signed, OrderType.FOK)
+            with open("/tmp/live_exec.log", "a") as _f:
+                _f.write(f"  resp: {resp}\n")
+        except Exception as e:
+            with open("/tmp/live_exec.log", "a") as _f:
+                _f.write(f"  EXC: {type(e).__name__}: {e}\n")
+            raise
 
         success = bool(resp.get("success", False))
         making = float(resp.get("makingAmount", 0)) if success else 0.0
