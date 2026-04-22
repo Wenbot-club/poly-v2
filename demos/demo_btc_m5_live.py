@@ -392,7 +392,10 @@ def main(argv=None) -> None:
     if args.limit_hedge:
         import dataclasses
         cfg = dataclasses.replace(cfg, hedge_use_limit_approach=True)
-        print("[paper] limit-hedge simulation enabled", flush=True)
+        if args.live:
+            print("[!] LIVE LIMIT-HEDGE — GTC buy + SL sell orders will be posted", flush=True)
+        else:
+            print("[paper] limit-hedge simulation enabled", flush=True)
 
     try:
         asyncio.run(run_campaign_live(args.windows, args.output_dir, cfg=cfg, order_executor=order_executor))

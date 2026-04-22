@@ -207,6 +207,111 @@ class LiveOrderExecutor:
                 reject_reason=str(exc)[:200],
             )
 
+    # ------------------------------------------------------------------
+    # Limit-order hedge — live execution
+    # ------------------------------------------------------------------
+
+    async def post_limit_buy(
+        self,
+        token_id: str,
+        max_price: float,
+        usd_amount: float,
+        observed_ask: float,
+    ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
+        """
+        Post a GTC limit buy at max_price (immediately marketable since max_price >> ask).
+        Returns (order_id, fill_price, fill_shares).  fill_price/fill_shares are set if the
+        order was immediately matched in the post_order response; otherwise poll get_order_status.
+        """
+        self._hot_until = _time.time() + self._HOT_DURATION_S
+        try:
+            return await asyncio.to_thread(
+                self._do_post_limit_buy, token_id, max_price, usd_amount, observed_ask
+            )
+        except Exception as exc:
+            print(f"[live] post_limit_buy error: {exc}", flush=True)
+            return None, None, None
+
+    def _do_post_limit_buy(
+        self,
+        token_id: str,
+        max_price: float,
+        usd_amount: float,
+        observed_ask: float,
+    ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+
+        args = MarketOrderArgs(
+            token_id=token_id,
+            amount=usd_amount,
+            price=max_price,
+            side="BUY",
+        )
+        signed = self._client.create_market_order(args)
+        resp = self._client.post_order(signed, OrderType.GTC)
+        print(f"[live] GTC buy resp: {resp}", flush=True)
+
+        order_id = resp.get("orderID") or resp.get("order_id")
+        making = float(resp.get("makingAmount") or 0)
+        taking = float(resp.get("takingAmount") or 0)
+        if making > 0 and taking > 0:
+            fill_price = making / taking
+            return order_id, fill_price, taking
+        return order_id, None, None
+
+    async def get_order_status(self, order_id: str) -> dict:
+        """Fetch current order state from CLOB."""
+        try:
+            result = await asyncio.to_thread(self._client.get_order, order_id)
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            print(f"[live] get_order_status error: {exc}", flush=True)
+            return {}
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order. Returns True on success."""
+        try:
+            await asyncio.to_thread(self._client.cancel_order, order_id)
+            print(f"[live] cancelled order {order_id}", flush=True)
+            return True
+        except Exception as exc:
+            print(f"[live] cancel_order error: {exc}", flush=True)
+            return False
+
+    async def post_limit_sell(
+        self,
+        token_id: str,
+        sell_price: float,
+        shares: float,
+    ) -> "Optional[str]":
+        """Post a GTC limit sell at sell_price. Returns order_id or None on error."""
+        try:
+            return await asyncio.to_thread(
+                self._do_post_limit_sell, token_id, sell_price, shares
+            )
+        except Exception as exc:
+            print(f"[live] post_limit_sell error: {exc}", flush=True)
+            return None
+
+    def _do_post_limit_sell(
+        self,
+        token_id: str,
+        sell_price: float,
+        shares: float,
+    ) -> "Optional[str]":
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        args = OrderArgs(
+            token_id=token_id,
+            price=sell_price,
+            size=shares,
+            side="SELL",
+        )
+        signed = self._client.create_order(args)
+        resp = self._client.post_order(signed, OrderType.GTC)
+        print(f"[live] GTC sell (SL) resp: {resp}", flush=True)
+        return resp.get("orderID") or resp.get("order_id")
+
     def _post_fok(
         self,
         token_id: str,
