@@ -241,11 +241,13 @@ class LiveOrderExecutor:
     ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
         from py_clob_client.clob_types import OrderArgs, OrderType
 
-        # Price = observed_ask + slippage buffer, capped by max_price.
-        # Size = usd_amount / price → collateral locked is exactly usd_amount (hard $ cap).
+        # Limit price = ask + buffer, capped by max_price.
         price = round(min(observed_ask + 0.05, max_price), 2)
-        price = max(price, 0.02)  # respect tick size minimum
-        size = round(usd_amount / price, 4)
+        price = max(price, 0.02)
+        # Size from observed_ask so fill cost ≈ usd_amount.
+        # Floor at 0.20 caps share count when ask is very low.
+        ask_for_size = max(round(observed_ask, 2), 0.20)
+        size = round(usd_amount / ask_for_size, 4)
         args = OrderArgs(
             token_id=token_id,
             price=price,
