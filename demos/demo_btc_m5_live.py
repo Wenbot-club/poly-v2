@@ -29,6 +29,11 @@ from typing import Optional
 
 import aiohttp
 
+# Force line-buffered stdout so logs appear immediately under systemd/nohup.
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from bot.latency import LatencyRecord, LatencyTracker
 from bot.m5_session import M5Session, M5SignalState, BtcHistory
 from bot.m5_summary import TradeRecord, aggregate_trades
