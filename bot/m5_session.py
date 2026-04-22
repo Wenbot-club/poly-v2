@@ -635,6 +635,11 @@ class M5Session:
                 record.pnl_leg1 = s.pnl_leg1
                 record.pnl_hedge = s.pnl_hedge
                 record.net_pnl = s.net_pnl
+                # Trailing stop exited the hedge early — use actual exit pnl
+                if (record.hedge_limit_trailing_stop_triggered
+                        and record.hedge_limit_exit_pnl is not None):
+                    record.pnl_hedge = record.hedge_limit_exit_pnl
+                    record.net_pnl = round(record.pnl_leg1 + record.pnl_hedge, 6)
         else:
             # No position — still wait for window end before returning
             now = self._time_fn()
