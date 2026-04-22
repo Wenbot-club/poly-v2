@@ -673,9 +673,13 @@ class M5Session:
 
         # HEDGE watch: only if LEG1 was taken
         if record.entry_side is not None:
-            # Pre-sign hedge order in background so the hot path only posts.
             self._launch_hedge_presign(record.entry_side, up_id, down_id)
-            await self._watch_for_hedge(record, ptb, up_id, down_id, window_ts, window_end_s)
+            if cfg.hedge_use_limit_approach:
+                await self._watch_for_hedge_limit_paper(
+                    record, ptb, up_id, down_id, window_ts, window_end_s
+                )
+            else:
+                await self._watch_for_hedge(record, ptb, up_id, down_id, window_ts, window_end_s)
 
     # ------------------------------------------------------------------
     # EARLY entry
@@ -850,6 +854,188 @@ class M5Session:
         asyncio.create_task(
             self._order_executor.presign_hedge(hedge_token_id, self._cfg.hedge_bet_usd)
         )
+
+    # ------------------------------------------------------------------
+    # Limit-order hedge — paper simulation
+    # ------------------------------------------------------------------
+
+    async def _watch_for_hedge_limit_paper(
+        self,
+        record: TradeRecord,
+        ptb: float,
+        up_id: str,
+        down_id: str,
+        window_ts: int,
+        window_end_s: float,
+    ) -> None:
+        """
+        Paper simulation of a pre-positioned passive bid + trailing-stop exit.
+
+        Passive fill model: simulated bid = best_ask - spread_estimate.
+        Fill triggers when best_ask <= sim_bid + 0.005 (market came to us).
+        Trailing stop triggers when best_ask < peak * trailing_stop_ratio
+        AND profit_per_share > min_profit_per_share.
+
+        When the real trigger fires and passive hasn't filled, falls back to
+        the same FOK execution as _watch_for_hedge.
+
+        All sim results are written to record.hedge_limit_* fields.
+        """
+        if record.hedged:
+            return
+
+        cfg = self._cfg
+        entry_side = record.entry_side
+        hedge_token_id = down_id if entry_side == "up" else up_id
+        hedge_side = "down" if entry_side == "up" else "up"
+
+        sim_bid: Optional[float] = None
+        sim_filled: Optional[float] = None
+        sim_shares: Optional[float] = None
+        reprices: int = 0
+        peak_price: float = 0.0
+        fill_elapsed: Optional[float] = None
+        fill_source: Optional[str] = None
+
+        while self._time_fn() < window_end_s:
+            elapsed_s = self._elapsed(window_ts)
+
+            if elapsed_s >= cfg.hedge_cutoff_s:
+                if sim_filled is None:
+                    self._hedge_blocked_by_cutoff = True
+                    print(f"[m5] limit_hedge: cutoff at {elapsed_s:.1f}s — no fill", flush=True)
+                break
+
+            btc = self._signals.btc_price
+            best_ask = self._token_prices.get(hedge_token_id)
+
+            # ── PRE-FILL: maintain passive bid ──────────────────────────
+            if sim_filled is None:
+                if best_ask is not None:
+                    btc_fraction = (
+                        abs(btc - ptb) / cfg.hedge_threshold
+                        if btc is not None else 0.0
+                    )
+                    spread = cfg.hedge_limit_spread_estimate
+                    if btc_fraction >= cfg.hedge_limit_early_aggressive_fraction:
+                        target_bid = best_ask - spread * 0.3
+                    else:
+                        target_bid = best_ask - spread
+                    target_bid = round(max(0.01, min(0.99, target_bid)), 2)
+
+                    if sim_bid is None:
+                        sim_bid = target_bid
+                        record.hedge_limit_initial_bid = target_bid
+                    elif abs(target_bid - sim_bid) >= cfg.hedge_limit_reprice_min_move:
+                        sim_bid = target_bid
+                        reprices += 1
+
+                    # Passive fill: ask crossed into our bid
+                    if best_ask <= sim_bid + 0.005:
+                        sim_filled = sim_bid
+                        sim_shares = cfg.hedge_bet_usd / sim_filled
+                        fill_elapsed = elapsed_s
+                        fill_source = "passive"
+                        peak_price = best_ask
+                        print(
+                            f"[m5] limit_hedge: passive fill t={elapsed_s:.1f}s"
+                            f"  bid={sim_bid:.3f}  ask={best_ask:.3f}",
+                            flush=True,
+                        )
+
+                    # Real trigger → FOK fallback (same as standard hedge)
+                    elif btc is not None and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold):
+                        record.hedge_tick_ts_ms = self._signals.btc_price_ts_ms
+                        record.hedge_decision_ts_ms = int(self._time_fn() * 1000)
+                        executor = self._order_executor
+                        if executor is not None and hasattr(executor, "post_presigned_hedge"):
+                            fill = await executor.post_presigned_hedge(best_ask)
+                        else:
+                            fill = await self._execute_paper(
+                                hedge_token_id, best_ask, cfg.hedge_bet_usd, is_leg1=False
+                            )
+                        record.hedge_submit_ts_ms = int(self._time_fn() * 1000)
+                        self._apply_fill_trace(record, fill, "hedge")
+                        if fill.reject_reason is None:
+                            record.hedged = True
+                            record.hedge_elapsed_s = elapsed_s
+                            record.hedge_side = hedge_side
+                            record.hedge_price = fill.fill_price
+                            record.hedge_shares = fill.shares
+                            record.hedge_trigger_btc = btc
+                            sim_filled = fill.fill_price
+                            sim_shares = fill.shares
+                            fill_elapsed = elapsed_s
+                            fill_source = "fok_fallback"
+                            peak_price = best_ask
+
+            # ── POST-FILL: trailing stop ─────────────────────────────────
+            else:
+                if best_ask is not None:
+                    peak_price = max(peak_price, best_ask)
+                    profit_per_share = best_ask - sim_filled
+                    drop_from_peak = best_ask / peak_price if peak_price > 0 else 1.0
+
+                    if (profit_per_share > cfg.hedge_limit_min_profit_per_share
+                            and drop_from_peak < cfg.hedge_limit_trailing_stop_ratio):
+                        exit_pnl = round(sim_shares * (best_ask - sim_filled), 4)
+                        record.hedge_limit_trailing_stop_triggered = True
+                        record.hedge_limit_exit_elapsed_s = elapsed_s
+                        record.hedge_limit_exit_price = best_ask
+                        record.hedge_limit_exit_pnl = exit_pnl
+                        print(
+                            f"[m5] limit_hedge: trailing stop t={elapsed_s:.1f}s"
+                            f"  fill={sim_filled:.3f}  peak={peak_price:.3f}"
+                            f"  exit={best_ask:.3f}  pnl={exit_pnl:+.3f}",
+                            flush=True,
+                        )
+                        break
+
+                    # Late cut: hedge underwater + BTC reversed toward LEG1
+                    if (elapsed_s > cfg.hedge_limit_late_cut_elapsed_s
+                            and best_ask < sim_filled
+                            and btc is not None
+                            and baseline_direction(btc, ptb) == entry_side):
+                        exit_pnl = round(sim_shares * (best_ask - sim_filled), 4)
+                        record.hedge_limit_trailing_stop_triggered = True
+                        record.hedge_limit_exit_elapsed_s = elapsed_s
+                        record.hedge_limit_exit_price = best_ask
+                        record.hedge_limit_exit_pnl = exit_pnl
+                        print(
+                            f"[m5] limit_hedge: late cut t={elapsed_s:.1f}s"
+                            f"  fill={sim_filled:.3f}  exit={best_ask:.3f}"
+                            f"  pnl={exit_pnl:+.3f}",
+                            flush=True,
+                        )
+                        break
+
+            await asyncio.sleep(0.2)
+
+        # ── Finalise record ──────────────────────────────────────────────
+        record.hedge_limit_reprices = reprices
+        record.hedge_limit_fill_elapsed_s = fill_elapsed
+        record.hedge_limit_fill_source = fill_source
+        record.hedge_limit_fill_price = sim_filled
+        record.hedge_limit_peak_bid = round(peak_price, 4) if peak_price else None
+
+        # Execute the paper fill for a passive sim fill (no real order needed)
+        if sim_filled is not None and fill_source == "passive" and not record.hedged:
+            fill = PaperFillResult(
+                fill_price=sim_filled,
+                shares=sim_shares,
+                observed_best_ask=sim_filled + cfg.hedge_limit_spread_estimate,
+                attempted_price=sim_filled,
+                slippage=0.0,
+                retries=0,
+                reject_reason=None,
+            )
+            self._apply_fill_trace(record, fill, "hedge")
+            record.hedged = True
+            record.hedge_elapsed_s = fill_elapsed
+            record.hedge_side = hedge_side
+            record.hedge_price = sim_filled
+            record.hedge_shares = sim_shares
+            record.hedge_trigger_btc = self._signals.btc_price
 
     # ------------------------------------------------------------------
     # Paper execution

@@ -100,12 +100,24 @@ class TradeRecord:
     entry_block_reason: Optional[str] = None   # "noise_zone" | "edge_not_enough" | "probability_not_strong_enough" | ...
 
     # Latency timestamps (epoch-ms, populated in live/paper-live mode)
-    entry_tick_ts_ms: Optional[int] = None     # btc_price_ts_ms at entry decision
-    entry_decision_ts_ms: Optional[int] = None # wall-clock when strategy decided to enter
-    entry_submit_ts_ms: Optional[int] = None   # wall-clock after paper fill
-    hedge_tick_ts_ms: Optional[int] = None     # btc_price_ts_ms at hedge trigger
-    hedge_decision_ts_ms: Optional[int] = None # wall-clock when hedge decided
-    hedge_submit_ts_ms: Optional[int] = None   # wall-clock after hedge paper fill
+    entry_tick_ts_ms: Optional[int] = None
+    entry_decision_ts_ms: Optional[int] = None
+    entry_submit_ts_ms: Optional[int] = None
+    hedge_tick_ts_ms: Optional[int] = None
+    hedge_decision_ts_ms: Optional[int] = None
+    hedge_submit_ts_ms: Optional[int] = None
+
+    # Limit-order hedge simulation fields (populated when hedge_use_limit_approach=True)
+    hedge_limit_initial_bid: Optional[float] = None
+    hedge_limit_fill_elapsed_s: Optional[float] = None
+    hedge_limit_fill_source: Optional[str] = None   # "passive" | "fok_fallback"
+    hedge_limit_fill_price: Optional[float] = None
+    hedge_limit_reprices: int = 0
+    hedge_limit_peak_bid: Optional[float] = None
+    hedge_limit_trailing_stop_triggered: bool = False
+    hedge_limit_exit_elapsed_s: Optional[float] = None
+    hedge_limit_exit_price: Optional[float] = None
+    hedge_limit_exit_pnl: Optional[float] = None
 
 
 @dataclass

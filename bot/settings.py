@@ -116,6 +116,14 @@ class M5Config:
     settlement_initial_delay_s: float = 15.0
     settlement_poll_s: float = 4.0
     settlement_max_attempts: int = 20
+    # Limit-order hedge paper simulation (set hedge_use_limit_approach=True to enable)
+    hedge_use_limit_approach: bool = False
+    hedge_limit_spread_estimate: float = 0.02
+    hedge_limit_trailing_stop_ratio: float = 0.85
+    hedge_limit_min_profit_per_share: float = 0.05
+    hedge_limit_early_aggressive_fraction: float = 0.70
+    hedge_limit_reprice_min_move: float = 0.01
+    hedge_limit_late_cut_elapsed_s: float = 270.0
 
 
 DEFAULT_M5_CONFIG = M5Config()

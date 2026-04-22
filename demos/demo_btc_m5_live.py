@@ -320,10 +320,15 @@ def _print_record(record: TradeRecord) -> None:
         print(f"  entry  : mode={record.entry_mode}  side={record.entry_side}"
               f"  t={record.entry_elapsed_s:.1f}s  price={record.entry_price:.4f}")
     if record.hedged:
+        src = record.hedge_limit_fill_source or "fok"
         print(f"  hedge  : side={record.hedge_side}  t={record.hedge_elapsed_s:.1f}s"
-              f"  price={record.hedge_price:.4f}")
+              f"  price={record.hedge_price:.4f}  src={src}")
     if record.hedge_blocked_by_cutoff:
         print("  hedge  : blocked by cutoff")
+    if record.hedge_limit_trailing_stop_triggered:
+        print(f"  limit_exit: t={record.hedge_limit_exit_elapsed_s:.1f}s"
+              f"  price={record.hedge_limit_exit_price:.4f}"
+              f"  pnl={record.hedge_limit_exit_pnl:+.3f}")
     print(f"  result : {record.result}  pnl_leg1={record.pnl_leg1}"
           f"  pnl_hedge={record.pnl_hedge}  net={record.net_pnl}")
 
@@ -351,6 +356,8 @@ def main(argv=None) -> None:
                         help="Output directory")
     parser.add_argument("--live", action="store_true",
                         help="Post real orders to Polymarket CLOB (default: paper)")
+    parser.add_argument("--limit-hedge", action="store_true",
+                        help="Simulate limit-order hedge approach (paper only)")
     args = parser.parse_args(argv)
 
     order_executor = None
@@ -369,8 +376,14 @@ def main(argv=None) -> None:
     except ImportError:
         pass
 
+    cfg = DEFAULT_M5_CONFIG
+    if args.limit_hedge:
+        import dataclasses
+        cfg = dataclasses.replace(cfg, hedge_use_limit_approach=True)
+        print("[paper] limit-hedge simulation enabled", flush=True)
+
     try:
-        asyncio.run(run_campaign_live(args.windows, args.output_dir, order_executor=order_executor))
+        asyncio.run(run_campaign_live(args.windows, args.output_dir, cfg=cfg, order_executor=order_executor))
     except KeyboardInterrupt:
         print("\n[interrupted]")
 
