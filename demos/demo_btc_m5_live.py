@@ -321,8 +321,12 @@ def _print_record(record: TradeRecord) -> None:
               f"  t={record.entry_elapsed_s:.1f}s  price={record.entry_price:.4f}")
     if record.hedged:
         src = record.hedge_limit_fill_source or "fok"
+        hedge_btc_info = ""
+        if record.hedge_trigger_btc is not None and record.ptb is not None:
+            dist = record.hedge_trigger_btc - record.ptb
+            hedge_btc_info = f"  btc={record.hedge_trigger_btc:.2f}  ptb={record.ptb:.2f}  Δ={dist:+.2f}"
         print(f"  hedge  : side={record.hedge_side}  t={record.hedge_elapsed_s:.1f}s"
-              f"  price={record.hedge_price:.4f}  src={src}")
+              f"  price={record.hedge_price:.4f}  src={src}{hedge_btc_info}")
     elif record.hedge_limit_fill_source == "skipped":
         print(f"  hedge  : SKIPPED (ask > max_price at trigger)")
     if record.hedge_blocked_by_cutoff:
