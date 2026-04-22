@@ -679,7 +679,7 @@ class M5Session:
         # HEDGE watch: only if LEG1 was taken
         if record.entry_side is not None:
             self._launch_hedge_presign(record.entry_side, up_id, down_id)
-            if cfg.hedge_use_limit_approach and record.entry_mode == "early":
+            if cfg.hedge_use_limit_approach:
                 await self._watch_for_hedge_limit_paper(
                     record, ptb, up_id, down_id, window_ts, window_end_s
                 )
