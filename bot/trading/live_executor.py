@@ -242,9 +242,11 @@ class LiveOrderExecutor:
         from py_clob_client.clob_types import OrderArgs, OrderType
 
         price = round(max_price, 2)
-        # Size from max_price so collateral locked = usd_amount exactly.
-        # Fill at lower ask returns excess collateral; we never overspend.
-        size = round(usd_amount / price, 4)
+        # Size from observed_ask to deploy ~usd_amount at market price.
+        # Floor at max_price/2 caps max shares when ask is very low (prevents book sweep).
+        ask_floor = round(price / 2, 2)
+        ask_for_sizing = max(round(observed_ask, 2), ask_floor)
+        size = round(usd_amount / ask_for_sizing, 4)
         args = OrderArgs(
             token_id=token_id,
             price=price,
