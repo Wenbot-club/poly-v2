@@ -679,7 +679,13 @@ class M5Session:
         # HEDGE watch: only if LEG1 was taken
         if record.entry_side is not None:
             self._launch_hedge_presign(record.entry_side, up_id, down_id)
-            if cfg.hedge_use_limit_approach:
+            entry_price = record.entry_price or 0.0
+            if 0.45 <= entry_price <= 0.55:
+                print(
+                    f"[m5] hedge disabled: leg1 price={entry_price:.4f} in noise zone [0.45, 0.55]",
+                    flush=True,
+                )
+            elif cfg.hedge_use_limit_approach:
                 _live = (self._order_executor is not None
                          and hasattr(self._order_executor, "post_limit_buy"))
                 if _live:
