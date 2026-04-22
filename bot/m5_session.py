@@ -831,11 +831,6 @@ class M5Session:
         while self._time_fn() < window_end_s:
             elapsed_s = self._elapsed(window_ts)
 
-            if elapsed_s >= cfg.hedge_cutoff_s:
-                self._hedge_blocked_by_cutoff = True
-                print(f"[m5] hedge_cutoff at {elapsed_s:.1f}s — no hedge posted", flush=True)
-                break
-
             btc = self._signals.btc_price
             if btc is not None and record.entry_side is not None:
                 if should_hedge(record.entry_side, btc, ptb, cfg.hedge_threshold):
@@ -966,12 +961,6 @@ class M5Session:
 
         while self._time_fn() < window_end_s:
             elapsed_s = self._elapsed(window_ts)
-
-            if elapsed_s >= cfg.hedge_cutoff_s:
-                if sim_filled is None:
-                    self._hedge_blocked_by_cutoff = True
-                    print(f"[m5] limit_hedge: cutoff at {elapsed_s:.1f}s — no fill", flush=True)
-                break
 
             btc = self._signals.btc_price
             best_ask = self._token_prices.get(hedge_token_id)
@@ -1196,14 +1185,6 @@ class M5Session:
         while self._time_fn() < window_end_s:
             elapsed_s = self._elapsed(window_ts)
 
-            if elapsed_s >= cfg.hedge_cutoff_s:
-                if fill_price is None and buy_order_id is None:
-                    self._hedge_blocked_by_cutoff = True
-                    print(
-                        f"[m5] limit_hedge_live: cutoff at {elapsed_s:.1f}s — no fill",
-                        flush=True,
-                    )
-                break
 
             btc = self._signals.btc_price
             best_ask = self._token_prices.get(hedge_token_id)

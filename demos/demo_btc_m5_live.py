@@ -251,7 +251,14 @@ async def run_campaign_live(
                     token_prices=token_prices if prefetched is not None else None,
                     order_executor=order_executor,
                 )
-                record = await session.run(wts)
+                try:
+                    record = await session.run(wts)
+                except Exception as exc:
+                    print(f"\n[live] window {label} ERROR: {exc} — skipping to next", flush=True)
+                    wts += cfg.window_seconds
+                    i += 1
+                    continue
+
                 trades.append(record)
                 _record_latency(record, latency_tracker)
 
