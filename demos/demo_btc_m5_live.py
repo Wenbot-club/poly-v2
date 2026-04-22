@@ -48,7 +48,9 @@ from bot.settings import DEFAULT_M5_CONFIG, M5Config
 # ---------------------------------------------------------------------------
 
 import os as _os
-_BINANCE_WS = _os.environ.get("BINANCE_WS_URL", "") or None  # None = use default
+# Default to Binance.US stream — stream.binance.com is geo-blocked from US AWS IPs (HTTP 451).
+# Override via BINANCE_WS_URL env var if needed (e.g. non-US deployment).
+_BINANCE_WS = _os.environ.get("BINANCE_WS_URL", "") or BINANCE_US_WS_URL
 
 
 async def _update_binance_loop(
@@ -57,8 +59,8 @@ async def _update_binance_loop(
     btc_history: BtcHistory,
 ) -> None:
     """Stream Binance BTC/USDT aggTrade → state + history."""
-    kwargs = {"ws_url": _BINANCE_WS} if _BINANCE_WS else {}
-    provider = BinanceSignalProvider(session=http, **kwargs)
+    print(f"[binance] connecting to {_BINANCE_WS}", flush=True)
+    provider = BinanceSignalProvider(session=http, ws_url=_BINANCE_WS)
     await provider.connect("btc/usd")
     try:
         async for tick in provider.iter_signals():
