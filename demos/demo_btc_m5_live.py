@@ -37,7 +37,7 @@ sys.stderr.reconfigure(line_buffering=True)
 from bot.latency import LatencyRecord, LatencyTracker
 from bot.m5_session import M5Session, M5SignalState, BtcHistory
 from bot.m5_summary import TradeRecord, aggregate_trades
-from bot.providers.binance_signal import BinanceSignalProvider
+from bot.providers.binance_signal import BinanceSignalProvider, BINANCE_US_WS_URL
 from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_M5_CONFIG, M5Config
@@ -47,13 +47,18 @@ from bot.settings import DEFAULT_M5_CONFIG, M5Config
 # Background feed tasks
 # ---------------------------------------------------------------------------
 
+import os as _os
+_BINANCE_WS = _os.environ.get("BINANCE_WS_URL", "") or None  # None = use default
+
+
 async def _update_binance_loop(
     http: aiohttp.ClientSession,
     state: M5SignalState,
     btc_history: BtcHistory,
 ) -> None:
     """Stream Binance BTC/USDT aggTrade → state + history."""
-    provider = BinanceSignalProvider(session=http)
+    kwargs = {"ws_url": _BINANCE_WS} if _BINANCE_WS else {}
+    provider = BinanceSignalProvider(session=http, **kwargs)
     await provider.connect("btc/usd")
     try:
         async for tick in provider.iter_signals():
