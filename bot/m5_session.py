@@ -679,7 +679,7 @@ class M5Session:
         # HEDGE watch: only if LEG1 was taken
         if record.entry_side is not None:
             self._launch_hedge_presign(record.entry_side, up_id, down_id)
-            if cfg.hedge_use_limit_approach:
+            if cfg.hedge_use_limit_approach and record.entry_mode == "early":
                 await self._watch_for_hedge_limit_paper(
                     record, ptb, up_id, down_id, window_ts, window_end_s
                 )
@@ -939,6 +939,7 @@ class M5Session:
                             fill_source = "anticipatory"
                             peak_price = best_ask
                             record.hedge_limit_initial_bid = best_ask
+                            record.hedge_trigger_btc = btc  # BTC at fill time, not end
                             print(
                                 f"[m5] limit_hedge: anticipatory fill t={elapsed_s:.1f}s"
                                 f"  btc={btc:.2f}  ptb={ptb:.2f}"
@@ -1044,7 +1045,7 @@ class M5Session:
             record.hedge_side = hedge_side
             record.hedge_price = sim_filled
             record.hedge_shares = sim_shares
-            record.hedge_trigger_btc = self._signals.btc_price
+            # hedge_trigger_btc already set at fill time for anticipatory fills
 
     # ------------------------------------------------------------------
     # Paper execution
