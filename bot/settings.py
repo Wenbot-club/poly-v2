@@ -129,9 +129,11 @@ class M5Config:
     # Never pay more than this for the anticipatory hedge; if ask > cap when
     # trigger fires → skip hedge entirely (record hedge_limit_fill_source="skipped").
     hedge_limit_max_price: float = 0.65
-    # Trailing stop: exit early when token drops below peak * ratio after profit >= min.
-    hedge_limit_trailing_stop_ratio: float = 0.85
-    hedge_limit_min_profit_per_share: float = 0.05
+    # Armed stop-loss: once the hedge token gains arm_threshold from fill, arm
+    # a SL at fill + sl_offset. Locks in minimum sl_offset profit once we're
+    # comfortably in profit; lets winners run until reversal hits the SL.
+    hedge_limit_sl_arm_threshold_usd: float = 0.20
+    hedge_limit_sl_offset_usd: float = 0.05
     # Late cut: exit early when underwater AND BTC has flipped back to leg1 side.
     hedge_limit_late_cut_elapsed_s: float = 270.0
 

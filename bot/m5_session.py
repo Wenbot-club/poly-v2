@@ -905,6 +905,7 @@ class M5Session:
         peak_price: float = 0.0
         fill_elapsed: Optional[float] = None
         fill_source: Optional[str] = None
+        sl_armed: bool = False
 
         def _in_anticipation_zone(btc: float, now_ms: int) -> tuple[bool, str]:
             """
@@ -1029,18 +1030,28 @@ class M5Session:
 
                 if best_ask is not None:
                     peak_price = max(peak_price, best_ask)
-                    profit_per_share = best_ask - sim_filled
-                    drop_from_peak = best_ask / peak_price if peak_price > 0 else 1.0
+                    arm_level = sim_filled + cfg.hedge_limit_sl_arm_threshold_usd
+                    sl_level = sim_filled + cfg.hedge_limit_sl_offset_usd
 
-                    if (profit_per_share > cfg.hedge_limit_min_profit_per_share
-                            and drop_from_peak < cfg.hedge_limit_trailing_stop_ratio):
+                    # Arm the SL once the token has gained enough
+                    if not sl_armed and best_ask >= arm_level:
+                        sl_armed = True
+                        print(
+                            f"[m5] limit_hedge: SL armed t={elapsed_s:.1f}s"
+                            f"  fill={sim_filled:.3f}  ask={best_ask:.3f}"
+                            f"  → SL at {sl_level:.3f}",
+                            flush=True,
+                        )
+
+                    # If SL armed and price falls back to SL level → exit
+                    if sl_armed and best_ask <= sl_level:
                         exit_pnl = round(sim_shares * (best_ask - sim_filled), 4)
                         record.hedge_limit_trailing_stop_triggered = True
                         record.hedge_limit_exit_elapsed_s = elapsed_s
                         record.hedge_limit_exit_price = best_ask
                         record.hedge_limit_exit_pnl = exit_pnl
                         print(
-                            f"[m5] limit_hedge: trailing stop t={elapsed_s:.1f}s"
+                            f"[m5] limit_hedge: SL hit t={elapsed_s:.1f}s"
                             f"  fill={sim_filled:.3f}  peak={peak_price:.3f}"
                             f"  exit={best_ask:.3f}  pnl={exit_pnl:+.3f}",
                             flush=True,
