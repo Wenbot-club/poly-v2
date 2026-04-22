@@ -239,15 +239,17 @@ class LiveOrderExecutor:
         usd_amount: float,
         observed_ask: float,
     ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, OrderType
 
-        args = MarketOrderArgs(
+        price = round(max_price, 2)
+        size = round(usd_amount / price, 4)  # shares, 4-decimal tick
+        args = OrderArgs(
             token_id=token_id,
-            amount=usd_amount,
-            price=max_price,
+            price=price,
+            size=size,
             side="BUY",
         )
-        signed = self._client.create_market_order(args)
+        signed = self._client.create_order(args)
         resp = self._client.post_order(signed, OrderType.GTC)
         print(f"[live] GTC buy resp: {resp}", flush=True)
 
