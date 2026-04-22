@@ -239,26 +239,27 @@ class LiveOrderExecutor:
         usd_amount: float,
         observed_ask: float,
     ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, OrderType
 
-        # Market FOK with amount=usd_amount: the CLOB fills exactly $usd_amount
-        # from the book (or rejects the whole order if insufficient liquidity).
-        # price=max_price is the worst-case cap — never pays above that.
-        args = MarketOrderArgs(
+        # Price = observed_ask + slippage buffer, capped by max_price.
+        # Size = usd_amount / price → collateral locked is exactly usd_amount (hard $ cap).
+        price = round(min(observed_ask + 0.05, max_price), 2)
+        price = max(price, 0.02)  # respect tick size minimum
+        size = round(usd_amount / price, 4)
+        args = OrderArgs(
             token_id=token_id,
-            amount=usd_amount,
-            price=round(max_price, 2),
+            price=price,
+            size=size,
             side="BUY",
         )
-        signed = self._client.create_market_order(args)
-        resp = self._client.post_order(signed, OrderType.FOK)
-        print(f"[live] FOK market buy resp: {resp}", flush=True)
+        signed = self._client.create_order(args)
+        resp = self._client.post_order(signed, OrderType.GTC)
+        print(f"[live] GTC buy resp: {resp}", flush=True)
 
-        success = bool(resp.get("success", False))
         order_id = resp.get("orderID") or resp.get("order_id")
         making = float(resp.get("makingAmount") or 0)
         taking = float(resp.get("takingAmount") or 0)
-        if success and making > 0 and taking > 0:
+        if making > 0 and taking > 0:
             fill_price = making / taking
             return order_id, fill_price, taking
         return order_id, None, None
