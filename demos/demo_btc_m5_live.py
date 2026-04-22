@@ -323,6 +323,8 @@ def _print_record(record: TradeRecord) -> None:
         src = record.hedge_limit_fill_source or "fok"
         print(f"  hedge  : side={record.hedge_side}  t={record.hedge_elapsed_s:.1f}s"
               f"  price={record.hedge_price:.4f}  src={src}")
+    elif record.hedge_limit_fill_source == "skipped":
+        print(f"  hedge  : SKIPPED (ask > max_price at trigger)")
     if record.hedge_blocked_by_cutoff:
         print("  hedge  : blocked by cutoff")
     if record.hedge_limit_trailing_stop_triggered:

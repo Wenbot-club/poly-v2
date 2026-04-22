@@ -118,11 +118,17 @@ class M5Config:
     settlement_max_attempts: int = 20
     # Limit-order hedge paper simulation (set hedge_use_limit_approach=True to enable)
     hedge_use_limit_approach: bool = False
-    hedge_limit_spread_estimate: float = 0.02
+    # Anticipatory fill: place when BTC is within this USD of PTB (on adverse side).
+    # For UP entry: fires when btc < ptb + buffer (i.e. 1 USD before crossing PTB,
+    # 2 USD before the 1.0 threshold trigger).
+    hedge_anticipation_buffer_usd: float = 1.0
+    # Never pay more than this for the anticipatory hedge; if ask > cap when
+    # trigger fires → skip hedge entirely (record hedge_limit_fill_source="skipped").
+    hedge_limit_max_price: float = 0.65
+    # Trailing stop: exit early when token drops below peak * ratio after profit >= min.
     hedge_limit_trailing_stop_ratio: float = 0.85
     hedge_limit_min_profit_per_share: float = 0.05
-    hedge_limit_early_aggressive_fraction: float = 0.70
-    hedge_limit_reprice_min_move: float = 0.01
+    # Late cut: exit early when underwater AND BTC has flipped back to leg1 side.
     hedge_limit_late_cut_elapsed_s: float = 270.0
 
 
