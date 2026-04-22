@@ -37,7 +37,7 @@ sys.stderr.reconfigure(line_buffering=True)
 from bot.latency import LatencyRecord, LatencyTracker
 from bot.m5_session import M5Session, M5SignalState, BtcHistory
 from bot.m5_summary import TradeRecord, aggregate_trades
-from bot.providers.binance_signal import BinanceSignalProvider, BINANCE_US_WS_URL
+from bot.providers.coinbase_signal import CoinbaseSignalProvider
 from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_M5_CONFIG, M5Config
@@ -47,26 +47,22 @@ from bot.settings import DEFAULT_M5_CONFIG, M5Config
 # Background feed tasks
 # ---------------------------------------------------------------------------
 
-import os as _os
-# Default to Binance.US stream — stream.binance.com is geo-blocked from US AWS IPs (HTTP 451).
-# Override via BINANCE_WS_URL env var if needed (e.g. non-US deployment).
-_BINANCE_WS = _os.environ.get("BINANCE_WS_URL", "") or BINANCE_US_WS_URL
-
-
-async def _update_binance_loop(
+async def _update_price_loop(
     http: aiohttp.ClientSession,
     state: M5SignalState,
     btc_history: BtcHistory,
 ) -> None:
-    """Stream Binance BTC/USDT aggTrade → state + history."""
-    print(f"[binance] connecting to {_BINANCE_WS}", flush=True)
-    provider = BinanceSignalProvider(session=http, ws_url=_BINANCE_WS)
+    """Stream Coinbase BTC/USD ticker → state + history."""
+    print("[coinbase] connecting to wss://ws-feed.exchange.coinbase.com (BTC-USD)", flush=True)
+    provider = CoinbaseSignalProvider(session=http)
     await provider.connect("btc/usd")
     try:
         async for tick in provider.iter_signals():
             state.btc_price = tick["value"]
             state.btc_price_ts_ms = tick["recv_timestamp_ms"]
             btc_history.record(tick["value"], tick["recv_timestamp_ms"])
+            if state.btc_price_ts_ms and state.btc_price_ts_ms % 30_000 < 1_000:
+                pass  # could log periodic health here
     finally:
         await provider.close()
 
@@ -186,7 +182,7 @@ async def run_campaign_live(
     latency_tracker = LatencyTracker()
 
     async with aiohttp.ClientSession() as http:
-        binance_task = asyncio.create_task(_update_binance_loop(http, state, btc_history))
+        price_task = asyncio.create_task(_update_price_loop(http, state, btc_history))
         chainlink_task = asyncio.create_task(_update_chainlink_loop(http, state))
 
         # Keep the CLOB TCP/TLS connection warm for live trading.
@@ -279,9 +275,9 @@ async def run_campaign_live(
                 wts += cfg.window_seconds
 
         finally:
-            binance_task.cancel()
+            price_task.cancel()
             chainlink_task.cancel()
-            for task in (binance_task, chainlink_task):
+            for task in (price_task, chainlink_task):
                 try:
                     await task
                 except asyncio.CancelledError:

@@ -36,28 +36,23 @@ sys.stderr.reconfigure(line_buffering=True)
 from bot.latency import LatencyRecord, LatencyTracker
 from bot.m5_session import M5Session, M5SignalState, BtcHistory
 from bot.m5_summary import TradeRecord, aggregate_trades
-from bot.providers.binance_signal import BinanceSignalProvider, BINANCE_US_ETH_WS_URL
+from bot.providers.coinbase_signal import CoinbaseSignalProvider
 from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_ETH_M5_CONFIG, M5Config
-
-import os as _os
-# Default to Binance.US stream — stream.binance.com is geo-blocked from US AWS IPs (HTTP 451).
-_BINANCE_ETH_WS = _os.environ.get("BINANCE_WS_ETH_URL", "") or BINANCE_US_ETH_WS_URL
-
 
 # ---------------------------------------------------------------------------
 # Background feed tasks
 # ---------------------------------------------------------------------------
 
-async def _update_eth_loop(
+async def _update_price_loop(
     http: aiohttp.ClientSession,
     state: M5SignalState,
     price_history: BtcHistory,
 ) -> None:
-    """Stream Binance ETH/USDT aggTrade → state + history."""
-    print(f"[binance] connecting to {_BINANCE_ETH_WS}", flush=True)
-    provider = BinanceSignalProvider(session=http, ws_url=_BINANCE_ETH_WS)
+    """Stream Coinbase ETH/USD ticker → state + history."""
+    print("[coinbase] connecting to wss://ws-feed.exchange.coinbase.com (ETH-USD)", flush=True)
+    provider = CoinbaseSignalProvider(session=http)
     await provider.connect("eth/usd")
     try:
         async for tick in provider.iter_signals():
@@ -176,7 +171,7 @@ async def run_campaign_live(
     latency_tracker = LatencyTracker()
 
     async with aiohttp.ClientSession() as http:
-        eth_task = asyncio.create_task(_update_eth_loop(http, state, price_history))
+        price_task = asyncio.create_task(_update_price_loop(http, state, price_history))
         chainlink_task = asyncio.create_task(_update_chainlink_loop(http, state))
 
         if order_executor is not None and hasattr(order_executor, "start_heartbeat"):
@@ -259,9 +254,9 @@ async def run_campaign_live(
                 wts += cfg.window_seconds
 
         finally:
-            eth_task.cancel()
+            price_task.cancel()
             chainlink_task.cancel()
-            for task in (eth_task, chainlink_task):
+            for task in (price_task, chainlink_task):
                 try:
                     await task
                 except asyncio.CancelledError:
