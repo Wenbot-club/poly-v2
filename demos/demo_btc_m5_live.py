@@ -325,8 +325,14 @@ def _print_record(record: TradeRecord) -> None:
         if record.hedge_trigger_btc is not None and record.ptb is not None:
             dist = record.hedge_trigger_btc - record.ptb
             hedge_btc_info = f"  btc={record.hedge_trigger_btc:.2f}  ptb={record.ptb:.2f}  Δ={dist:+.2f}"
+        lag_info = ""
+        if (record.hedge_limit_fill_source == "anticipatory"
+                and record.hedge_trigger_elapsed_s is not None
+                and record.hedge_elapsed_s is not None):
+            lag_s = record.hedge_trigger_elapsed_s - record.hedge_elapsed_s
+            lag_info = f"  trigger_lag={lag_s:+.1f}s"
         print(f"  hedge  : side={record.hedge_side}  t={record.hedge_elapsed_s:.1f}s"
-              f"  price={record.hedge_price:.4f}  src={src}{hedge_btc_info}")
+              f"  price={record.hedge_price:.4f}  src={src}{hedge_btc_info}{lag_info}")
     elif record.hedge_limit_fill_source == "skipped":
         print(f"  hedge  : SKIPPED (ask > max_price at trigger)")
     if record.hedge_blocked_by_cutoff:

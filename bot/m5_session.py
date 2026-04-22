@@ -958,6 +958,7 @@ class M5Session:
                 if triggered and sim_filled is None:
                     # Trigger fired, never managed to fill under max_price → skip
                     fill_source = "skipped"
+                    record.hedge_trigger_elapsed_s = elapsed_s
                     print(
                         f"[m5] limit_hedge: trigger fired, ask always > max_price"
                         f" ({best_ask:.3f} > {cfg.hedge_limit_max_price:.3f})"
@@ -966,8 +967,20 @@ class M5Session:
                     )
                     break
 
-            # ── POST-FILL: trailing stop ─────────────────────────────────
+            # ── POST-FILL: track trigger lag + trailing stop ────────────
             else:
+                # Record when real trigger fires (even if we're already filled)
+                if (btc is not None
+                        and record.hedge_trigger_elapsed_s is None
+                        and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold)):
+                    record.hedge_trigger_elapsed_s = elapsed_s
+                    lag_s = elapsed_s - fill_elapsed
+                    print(
+                        f"[m5] limit_hedge: real trigger at t={elapsed_s:.1f}s"
+                        f"  lag={lag_s:+.1f}s after anticipatory fill",
+                        flush=True,
+                    )
+
                 if best_ask is not None:
                     peak_price = max(peak_price, best_ask)
                     profit_per_share = best_ask - sim_filled

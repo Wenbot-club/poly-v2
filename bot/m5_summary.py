@@ -62,6 +62,7 @@ class TradeRecord:
     hedge_price: Optional[float] = None
     hedge_shares: Optional[float] = None
     hedge_trigger_btc: Optional[float] = None
+    hedge_trigger_elapsed_s: Optional[float] = None  # when real trigger fired (even if pre-filled)
 
     # Execution guards
     hedge_blocked_by_cutoff: bool = False
