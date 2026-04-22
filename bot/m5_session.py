@@ -906,11 +906,49 @@ class M5Session:
         fill_elapsed: Optional[float] = None
         fill_source: Optional[str] = None
 
-        def _in_anticipation_zone(btc: float) -> bool:
+        def _in_anticipation_zone(btc: float, now_ms: int) -> tuple[bool, str]:
+            """
+            Returns (should_place, reason).
+            Velocity-based: fire if ETA to trigger < hedge_anticipation_seconds.
+            Safety floor: always fire if BTC within min_buffer of PTB.
+            Fallback: static buffer if not enough samples for velocity.
+            """
+            # Safety floor — always fire if very close to PTB
+            min_buf = cfg.hedge_anticipation_min_buffer_usd
+            if entry_side == "up" and btc < ptb + min_buf:
+                return True, "safety_floor"
+            if entry_side == "down" and btc > ptb - min_buf:
+                return True, "safety_floor"
+
+            # Velocity-based ETA
+            btc_past = self._btc_history.price_n_secs_ago(
+                cfg.hedge_velocity_window_s, now_ms
+            )
+            if btc_past is not None:
+                velocity = (btc - btc_past) / cfg.hedge_velocity_window_s  # USD/s, signed
+                if entry_side == "up":
+                    trigger_level = ptb - cfg.hedge_threshold
+                    distance = btc - trigger_level
+                    if velocity < 0 and distance > 0:
+                        eta_s = distance / abs(velocity)
+                        if eta_s < cfg.hedge_anticipation_seconds:
+                            return True, f"velocity(eta={eta_s:.1f}s,v={velocity:+.2f})"
+                else:
+                    trigger_level = ptb + cfg.hedge_threshold
+                    distance = trigger_level - btc
+                    if velocity > 0 and distance > 0:
+                        eta_s = distance / velocity
+                        if eta_s < cfg.hedge_anticipation_seconds:
+                            return True, f"velocity(eta={eta_s:.1f}s,v={velocity:+.2f})"
+                return False, ""
+
+            # Fallback: static buffer (not enough samples yet)
             buf = cfg.hedge_anticipation_buffer_usd
-            if entry_side == "up":
-                return btc < ptb + buf
-            return btc > ptb - buf
+            if entry_side == "up" and btc < ptb + buf:
+                return True, "static_fallback"
+            if entry_side == "down" and btc > ptb - buf:
+                return True, "static_fallback"
+            return False, ""
 
         while self._time_fn() < window_end_s:
             elapsed_s = self._elapsed(window_ts)
@@ -929,7 +967,13 @@ class M5Session:
                 triggered = (btc is not None
                              and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold))
 
-                if btc is not None and _in_anticipation_zone(btc):
+                should_place = False
+                reason = ""
+                if btc is not None:
+                    now_ms = int(self._time_fn() * 1000)
+                    should_place, reason = _in_anticipation_zone(btc, now_ms)
+
+                if should_place:
                     if best_ask is not None:
                         if best_ask <= cfg.hedge_limit_max_price:
                             # Fill immediately — we're ahead of the trigger
@@ -944,7 +988,8 @@ class M5Session:
                                 f"[m5] limit_hedge: anticipatory fill t={elapsed_s:.1f}s"
                                 f"  btc={btc:.2f}  ptb={ptb:.2f}"
                                 f"  ask={best_ask:.3f}"
-                                f"  max={cfg.hedge_limit_max_price:.3f}",
+                                f"  max={cfg.hedge_limit_max_price:.3f}"
+                                f"  trig={reason}",
                                 flush=True,
                             )
                         else:

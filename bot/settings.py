@@ -118,9 +118,13 @@ class M5Config:
     settlement_max_attempts: int = 20
     # Limit-order hedge paper simulation (set hedge_use_limit_approach=True to enable)
     hedge_use_limit_approach: bool = False
-    # Anticipatory fill: place when BTC is within this USD of PTB (on adverse side).
-    # For UP entry: fires when btc < ptb + buffer (i.e. 1 USD before crossing PTB,
-    # 2 USD before the 1.0 threshold trigger).
+    # Velocity-based anticipation: compute BTC velocity over window_s, fire when
+    # ETA to trigger (at current velocity) < anticipation_seconds.
+    hedge_velocity_window_s: float = 5.0
+    hedge_anticipation_seconds: float = 5.0
+    # Safety floor: always fire when BTC within this USD of PTB (regardless of velocity).
+    hedge_anticipation_min_buffer_usd: float = 0.5
+    # Fallback: if velocity can't be computed (not enough samples), use this static buffer.
     hedge_anticipation_buffer_usd: float = 1.0
     # Never pay more than this for the anticipatory hedge; if ask > cap when
     # trigger fires → skip hedge entirely (record hedge_limit_fill_source="skipped").
