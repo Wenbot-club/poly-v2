@@ -170,7 +170,7 @@ def _record_latency(record: TradeRecord, tracker: LatencyTracker) -> None:
 # ---------------------------------------------------------------------------
 
 async def run_campaign_live(
-    window_count: int,
+    window_count: Optional[int],
     output_dir: Path,
     cfg: M5Config = DEFAULT_M5_CONFIG,
     order_executor=None,
@@ -197,11 +197,13 @@ async def run_campaign_live(
         next_tokens_cache_task: Optional[asyncio.Task] = None
 
         try:
-            for i in range(window_count):
+            i = 0
+            while window_count is None or i < window_count:
                 now = _time.time()
                 wait_s = max(0.0, wts - now)
+                label = f"{i+1}/{window_count}" if window_count is not None else str(i+1)
                 if wait_s > 5.0:
-                    print(f"\n[live] window {i+1}/{window_count}: ts={wts}"
+                    print(f"\n[live] window {label}: ts={wts}"
                           f" — waiting {wait_s:.0f}s")
                     await asyncio.sleep(wait_s)
 
@@ -216,7 +218,7 @@ async def run_campaign_live(
                     except Exception:
                         prefetched = None
 
-                print(f"\n[live] window {i+1}/{window_count}  ts={wts}"
+                print(f"\n[live] window {label}  ts={wts}"
                       f"  btc={state.btc_price}"
                       f"  chainlink={state.chainlink_price}"
                       f"  tokens_prefetch={'hit' if prefetched else 'miss'}")
@@ -273,6 +275,7 @@ async def run_campaign_live(
                     json.dump(dataclasses.asdict(record), f, indent=2)
 
                 wts += cfg.window_seconds
+                i += 1
 
         finally:
             price_task.cancel()
@@ -362,8 +365,8 @@ def _print_record(record: TradeRecord) -> None:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="BTC M5 paper-live runner (low-latency)")
-    parser.add_argument("--windows", type=int, default=6,
-                        help="Number of M5 windows (default: 6)")
+    parser.add_argument("--windows", type=int, default=None,
+                        help="Number of M5 windows to run (default: unlimited)")
     parser.add_argument("--output-dir", type=Path, default=Path("m5_out_live"),
                         help="Output directory")
     parser.add_argument("--live", action="store_true",
