@@ -1126,7 +1126,6 @@ class M5Session:
         hedge_token_id = down_id if entry_side == "up" else up_id
         hedge_side = "down" if entry_side == "up" else "up"
 
-        buy_order_id: Optional[str] = None
         sl_order_id: Optional[str] = None
         fill_price: Optional[float] = None
         fill_shares: Optional[float] = None
@@ -1135,6 +1134,11 @@ class M5Session:
         sl_armed: bool = False
         sl_triggered: bool = False
         peak_price: float = 0.0
+        # FAK accumulation state
+        accumulating: bool = False
+        total_cost: float = 0.0
+        total_shares_acc: float = 0.0
+        remaining_usd: float = cfg.hedge_bet_usd
 
         def _in_anticipation_zone(btc: float, now_ms: int) -> "tuple[bool, str]":
             min_buf = cfg.hedge_anticipation_min_buffer_usd
@@ -1182,99 +1186,71 @@ class M5Session:
                              and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold))
 
                 if buy_order_id is None:
-                    # Decide whether to place the buy order
-                    if btc is not None:
+                    # Start accumulation when in anticipation zone
+                    if not accumulating and btc is not None:
                         now_ms = int(self._time_fn() * 1000)
                         should_place, reason = _in_anticipation_zone(btc, now_ms)
-                        if should_place:
-                            if best_ask is not None:
-                                print(
-                                    f"[m5] limit_hedge_live: placing GTC buy t={elapsed_s:.1f}s"
-                                    f"  btc={btc:.2f}  ptb={ptb:.2f}"
-                                    f"  ask={best_ask:.3f}"
-                                    f"  trig={reason}",
-                                    flush=True,
-                                )
-                                record.hedge_limit_initial_bid = best_ask
-                                record.hedge_trigger_btc = btc
-                                oid, imm_price, imm_shares = await executor.post_limit_buy(
-                                    hedge_token_id,
-                                    best_ask + 0.02,
-                                    cfg.hedge_bet_usd,
-                                    best_ask,
-                                )
-                                if oid is None:
-                                    print(
-                                        f"[m5] limit_hedge_live: buy order rejected — retry next tick",
-                                        flush=True,
-                                    )
-                                else:
-                                    buy_order_id = oid
-                                    if imm_price is not None:
-                                        fill_price = imm_price
-                                        fill_shares = imm_shares
-                                        fill_elapsed = elapsed_s
-                                        fill_source = "anticipatory"
-                                        peak_price = fill_price
-                                        print(
-                                            f"[m5] limit_hedge_live: immediate fill t={elapsed_s:.1f}s"
-                                            f"  fill={fill_price:.4f}  shares={fill_shares:.4f}",
-                                            flush=True,
-                                        )
+                        if should_place and best_ask is not None:
+                            accumulating = True
+                            record.hedge_limit_initial_bid = best_ask
+                            record.hedge_trigger_btc = btc
+                            print(
+                                f"[m5] limit_hedge_live: start accumulation t={elapsed_s:.1f}s"
+                                f"  btc={btc:.2f}  ptb={ptb:.2f}"
+                                f"  ask={best_ask:.3f}  target={cfg.hedge_bet_usd:.2f}"
+                                f"  trig={reason}",
+                                flush=True,
+                            )
 
-                    # Trigger fired before we placed/filled → skip
-                    if triggered and buy_order_id is None:
-                        fill_source = "skipped"
-                        record.hedge_trigger_elapsed_s = elapsed_s
-                        print(
-                            f"[m5] limit_hedge_live: trigger fired, no fill yet → skipped",
-                            flush=True,
+                    # FAK loop: keep buying until target reached
+                    if accumulating and best_ask is not None and remaining_usd >= 0.10:
+                        filled_usd, fp, fs = await executor.post_limit_buy(
+                            hedge_token_id, best_ask + 0.02, remaining_usd, best_ask
                         )
-                        break
+                        if filled_usd > 0:
+                            total_cost += filled_usd
+                            total_shares_acc += fs
+                            remaining_usd -= filled_usd
+                            print(
+                                f"[m5] limit_hedge_live: +{filled_usd:.2f} filled"
+                                f"  total={total_cost:.2f}/{cfg.hedge_bet_usd:.2f}"
+                                f"  avg={total_cost/total_shares_acc:.4f}",
+                                flush=True,
+                            )
+                        if remaining_usd < 0.10 and total_cost > 0:
+                            fill_price = total_cost / total_shares_acc
+                            fill_shares = total_shares_acc
+                            fill_elapsed = elapsed_s
+                            fill_source = "anticipatory"
+                            peak_price = fill_price
+                            print(
+                                f"[m5] limit_hedge_live: fully accumulated t={elapsed_s:.1f}s"
+                                f"  fill={fill_price:.4f}  shares={fill_shares:.4f}"
+                                f"  cost={total_cost:.2f}",
+                                flush=True,
+                            )
 
-                else:
-                    # Order is open — poll for fill
-                    order = await executor.get_order_status(buy_order_id)
-                    status = order.get("status", "")
-                    making = float(order.get("makingAmount") or 0)
-                    taking = float(order.get("takingAmount") or 0)
-                    size_filled = float(order.get("sizeFilled") or order.get("size_filled") or 0)
-                    if making > 0 and taking > 0:
-                        fill_price = making / taking
-                        fill_shares = taking
-                        fill_elapsed = elapsed_s
-                        fill_source = "anticipatory"
-                        peak_price = fill_price
-                        print(
-                            f"[m5] limit_hedge_live: polled fill t={elapsed_s:.1f}s"
-                            f"  fill={fill_price:.4f}  shares={fill_shares:.4f}  status={status}",
-                            flush=True,
-                        )
-                    elif size_filled > 0 or status in ("MATCHED", "FILLED", "SETTLED"):
-                        # Partial fill info only — use best_ask as approximation
-                        fill_price = best_ask or cfg.hedge_limit_max_price
-                        fill_shares = size_filled if size_filled > 0 else cfg.hedge_bet_usd / fill_price
-                        fill_elapsed = elapsed_s
-                        fill_source = "anticipatory"
-                        peak_price = fill_price
-                        print(
-                            f"[m5] limit_hedge_live: polled fill (partial) t={elapsed_s:.1f}s"
-                            f"  fill≈{fill_price:.4f}  shares≈{fill_shares:.4f}  status={status}",
-                            flush=True,
-                        )
-
-                    # Trigger fired while order is open and not yet filled → cancel, skip
+                    # Trigger fired — accept partial accumulation or skip
                     if triggered and fill_price is None:
                         record.hedge_trigger_elapsed_s = elapsed_s
-                        print(
-                            f"[m5] limit_hedge_live: trigger fired, order open but unfilled"
-                            f" — cancelling buy {buy_order_id}",
-                            flush=True,
-                        )
-                        await executor.cancel_order(buy_order_id)
-                        buy_order_id = None
-                        fill_source = "skipped"
-                        break
+                        if total_cost > 0:
+                            fill_price = total_cost / total_shares_acc
+                            fill_shares = total_shares_acc
+                            fill_elapsed = elapsed_s
+                            fill_source = "anticipatory"
+                            peak_price = fill_price
+                            print(
+                                f"[m5] limit_hedge_live: trigger fired, partial fill"
+                                f"  cost={total_cost:.2f}  accepted",
+                                flush=True,
+                            )
+                        else:
+                            fill_source = "skipped"
+                            print(
+                                f"[m5] limit_hedge_live: trigger fired, no fill — skipped",
+                                flush=True,
+                            )
+                            break
 
             # ── POST-FILL ──────────────────────────────────────────────
             else:
@@ -1345,14 +1321,7 @@ class M5Session:
 
             await asyncio.sleep(0.5)
 
-        # ── Cleanup: cancel any open orders ─────────────────────────────
-        if buy_order_id is not None and fill_price is None:
-            print(
-                f"[m5] limit_hedge_live: cancelling open buy {buy_order_id}",
-                flush=True,
-            )
-            await executor.cancel_order(buy_order_id)
-
+        # ── Cleanup: cancel open SL sell if not triggered ───────────────
         if sl_order_id is not None and not sl_triggered:
             print(
                 f"[m5] limit_hedge_live: cancelling open SL sell {sl_order_id}",

@@ -134,7 +134,7 @@ async def run_test(args):
                 continue
 
             t_sent = _time.time()
-            order_id, fill_price, fill_shares = await executor.post_limit_buy(
+            filled_usd, fill_price, fill_shares = await executor.post_limit_buy(
                 token_id=token_id,
                 max_price=limit_price,
                 usd_amount=args.usd,
@@ -148,20 +148,16 @@ async def run_test(args):
             print(f"[{label}]  best_ask(après)={ask_after}  drift={drift:+.4f}" if drift is not None else f"[{label}]  best_ask(après)=N/A")
             print(f"[{label}]  latence envoi→réponse API : {latency_post_ms:.1f} ms")
 
-            if order_id is None:
-                print(f"[{label}]  ERREUR — ordre non posté")
-                continue
-
-            print(f"[{label}]  ordre posté  order_id={order_id}")
-
-            if fill_price is not None:
-                print(f"[{label}]  FILL IMMÉDIAT (dans la réponse post_order)  price={fill_price:.4f}  shares={fill_shares}")
+            if filled_usd > 0 and fill_price is not None:
+                print(f"[{label}]  FILLED  cost={filled_usd:.4f}  price={fill_price:.4f}  shares={fill_shares:.4f}")
                 print(f"[{label}]  latence totale envoi→fill : {latency_post_ms:.1f} ms")
-                continue
+            else:
+                print(f"[{label}]  AUCUN FILL (liquidity insuffisante ou rejeté)")
+            continue
 
-            print(f"[{label}]  En attente de fill ({args.timeout}s)...")
+            # dead code kept for reference: old polling path
             filled, matched, avg_price = await poll_until_filled(
-                executor, order_id, args.timeout, label, t_sent
+                executor, None, args.timeout, label, t_sent
             )
 
             if filled:

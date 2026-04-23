@@ -217,12 +217,9 @@ class LiveOrderExecutor:
         max_price: float,
         usd_amount: float,
         observed_ask: float,
-    ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
-        """
-        Post a GTC limit buy at max_price (immediately marketable since max_price >> ask).
-        Returns (order_id, fill_price, fill_shares).  fill_price/fill_shares are set if the
-        order was immediately matched in the post_order response; otherwise poll get_order_status.
-        """
+    ) -> "tuple[float, Optional[float], float]":
+        """FAK limit buy. Returns (filled_usd, avg_fill_price, filled_shares).
+        filled_usd=0 means nothing filled (rejected or no liquidity)."""
         self._hot_until = _time.time() + self._HOT_DURATION_S
         try:
             return await asyncio.to_thread(
@@ -230,7 +227,7 @@ class LiveOrderExecutor:
             )
         except Exception as exc:
             print(f"[live] post_limit_buy error: {exc}", flush=True)
-            return None, None, None
+            return 0.0, None, 0.0
 
     def _do_post_limit_buy(
         self,
@@ -238,29 +235,35 @@ class LiveOrderExecutor:
         max_price: float,
         usd_amount: float,
         observed_ask: float,
-    ) -> "tuple[Optional[str], Optional[float], Optional[float]]":
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    ) -> "tuple[float, Optional[float], float]":
+        """FAK limit buy: GTC at ask+2¢, cancel remainder immediately.
+        Returns (filled_usd, avg_fill_price, filled_shares).
+        filled_usd=0 means nothing filled."""
+        from py_clob_client.clob_types import OrderArgs, OrderType
 
-        # FOK market order: amount=usd_amount → fill exactly $usd_amount or reject.
-        # Never partial fills, never more than $usd_amount.
-        args = MarketOrderArgs(
-            token_id=token_id,
-            amount=usd_amount,
-            price=round(min(observed_ask + 0.02, 0.99), 2),
-            side="BUY",
-        )
-        signed = self._client.create_market_order(args)
-        resp = self._client.post_order(signed, OrderType.FOK)
-        print(f"[live] FOK hedge resp: {resp}", flush=True)
+        price = round(min(observed_ask + 0.02, 0.99), 2)
+        price = max(price, 0.02)
+        size = round(usd_amount / price, 4)
 
-        success = bool(resp.get("success", False))
+        args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
+        signed = self._client.create_order(args)
+        resp = self._client.post_order(signed, OrderType.GTC)
+        print(f"[live] FAK buy resp: {resp}", flush=True)
+
         order_id = resp.get("orderID") or resp.get("order_id")
         making = float(resp.get("makingAmount") or 0)
         taking = float(resp.get("takingAmount") or 0)
-        if success and making > 0 and taking > 0:
-            fill_price = making / taking
-            return order_id, fill_price, taking
-        return None, None, None
+
+        # Cancel any unfilled remainder (makes this FAK)
+        if order_id:
+            try:
+                self._client.cancel_order(order_id)
+            except Exception:
+                pass  # already fully filled — ignore
+
+        if making > 0 and taking > 0:
+            return making, making / taking, taking  # (filled_usd, avg_price, filled_shares)
+        return 0.0, None, 0.0
 
     async def get_order_status(self, order_id: str) -> dict:
         """Fetch current order state from CLOB."""
