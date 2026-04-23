@@ -68,18 +68,19 @@ async def fetch_best_ask(http: aiohttp.ClientSession, token_id: str) -> float | 
         return float(v) if v is not None else None
 
 
-async def poll_until_filled(executor, order_id: str, timeout_s: float, label: str):
+async def poll_until_filled(executor, order_id: str, timeout_s: float, label: str, t_sent: float):
+    """Poll toutes les 0.5s pour détecter le fill avec précision ~500ms."""
     deadline = _time.time() + timeout_s
     while _time.time() < deadline:
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
         status = await executor.get_order_status(order_id)
         size_matched = float(status.get("size_matched") or 0)
         size = float(status.get("size") or 0)
         order_status = status.get("status") or status.get("order_status") or "?"
         price = status.get("price") or status.get("avg_price") or "?"
-        elapsed = round(_time.time() - (deadline - timeout_s), 1)
-        print(f"  [{label}] +{elapsed}s  status={order_status}  matched={size_matched}/{size}  avg_price={price}")
-        if order_status in ("MATCHED", "matched", "FILLED", "filled"):
+        elapsed_ms = (_time.time() - t_sent) * 1000
+        print(f"  [{label}] +{elapsed_ms:.0f}ms  status={order_status}  matched={size_matched}/{size}  avg_price={price}")
+        if size_matched > 0 or order_status in ("MATCHED", "matched", "FILLED", "filled"):
             return True, size_matched, price
         if order_status in ("CANCELLED", "cancelled", "CANCELED", "canceled"):
             return False, 0, None
@@ -119,25 +120,33 @@ async def run_test(args):
             sides.append(("DOWN", down_id))
 
         for label, token_id in sides:
-            ask = await fetch_best_ask(http, token_id)
-            if ask is None:
+            ask_before = await fetch_best_ask(http, token_id)
+            if ask_before is None:
                 print(f"\n[{label}] Impossible de lire le best_ask — skip.")
                 continue
 
-            limit_price = round(ask + 0.01, 2)
+            limit_price = round(ask_before + 0.01, 2)
             limit_price = min(limit_price, 0.99)
-            print(f"\n[{label}]  best_ask={ask:.4f}  order_price={limit_price:.2f}  usd={args.usd}")
+            print(f"\n[{label}]  best_ask(avant)={ask_before:.4f}  order_price={limit_price:.2f}  usd={args.usd}")
 
             if not args.live:
                 print(f"[{label}]  DRY-RUN — aucun ordre envoyé (ajoute --live pour envoyer réellement)")
                 continue
 
+            t_sent = _time.time()
             order_id, fill_price, fill_shares = await executor.post_limit_buy(
                 token_id=token_id,
                 max_price=limit_price,
                 usd_amount=args.usd,
-                observed_ask=ask,
+                observed_ask=ask_before,
             )
+            t_posted = _time.time()
+            ask_after = await fetch_best_ask(http, token_id)
+            latency_post_ms = (t_posted - t_sent) * 1000
+
+            drift = None if ask_after is None else ask_after - ask_before
+            print(f"[{label}]  best_ask(après)={ask_after}  drift={drift:+.4f}" if drift is not None else f"[{label}]  best_ask(après)=N/A")
+            print(f"[{label}]  latence envoi→réponse API : {latency_post_ms:.1f} ms")
 
             if order_id is None:
                 print(f"[{label}]  ERREUR — ordre non posté")
@@ -146,16 +155,19 @@ async def run_test(args):
             print(f"[{label}]  ordre posté  order_id={order_id}")
 
             if fill_price is not None:
-                print(f"[{label}]  FILL IMMÉDIAT  price={fill_price:.4f}  shares={fill_shares}")
+                print(f"[{label}]  FILL IMMÉDIAT (dans la réponse post_order)  price={fill_price:.4f}  shares={fill_shares}")
+                print(f"[{label}]  latence totale envoi→fill : {latency_post_ms:.1f} ms")
                 continue
 
             print(f"[{label}]  En attente de fill ({args.timeout}s)...")
             filled, matched, avg_price = await poll_until_filled(
-                executor, order_id, args.timeout, label
+                executor, order_id, args.timeout, label, t_sent
             )
 
             if filled:
-                print(f"[{label}]  ✓ FILLED  avg_price={avg_price}  shares={matched}")
+                total_ms = (_time.time() - t_sent) * 1000
+                print(f"[{label}]  FILLED  avg_price={avg_price}  shares={matched}")
+                print(f"[{label}]  latence totale envoi→fill détecté : {total_ms:.1f} ms (précision ±2000ms poll)")
             else:
                 print(f"[{label}]  Timeout — annulation de l'ordre {order_id}")
                 cancelled = await executor.cancel_order(order_id)
@@ -166,8 +178,8 @@ def main():
     parser = argparse.ArgumentParser(description="Test d'ordres limites Polymarket")
     parser.add_argument("--live", action="store_true",
                         help="Envoyer de vrais ordres (sans ce flag = dry-run)")
-    parser.add_argument("--usd", type=float, default=0.10,
-                        help="Montant USD par ordre (défaut: 0.10)")
+    parser.add_argument("--usd", type=float, default=1.0,
+                        help="Montant USD par ordre (min Polymarket = $1, défaut: 1.0)")
     parser.add_argument("--side", choices=["up", "down", "both"], default="both",
                         help="Côté(s) à tester (défaut: both)")
     parser.add_argument("--timeout", type=float, default=30,
