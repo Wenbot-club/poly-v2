@@ -978,40 +978,27 @@ class M5Session:
 
                 if should_place:
                     if best_ask is not None:
-                        if best_ask <= cfg.hedge_limit_max_price:
-                            # Fill immediately — we're ahead of the trigger
-                            sim_filled = best_ask
-                            sim_shares = cfg.hedge_bet_usd / sim_filled
-                            fill_elapsed = elapsed_s
-                            fill_source = "anticipatory"
-                            peak_price = best_ask
-                            record.hedge_limit_initial_bid = best_ask
-                            record.hedge_trigger_btc = btc  # BTC at fill time, not end
-                            print(
-                                f"[m5] limit_hedge: anticipatory fill t={elapsed_s:.1f}s"
-                                f"  btc={btc:.2f}  ptb={ptb:.2f}"
-                                f"  ask={best_ask:.3f}"
-                                f"  max={cfg.hedge_limit_max_price:.3f}"
-                                f"  trig={reason}",
-                                flush=True,
-                            )
-                        else:
-                            # Ask above cap — log and keep watching
-                            print(
-                                f"[m5] limit_hedge: zone t={elapsed_s:.1f}s"
-                                f"  ask={best_ask:.3f} > max={cfg.hedge_limit_max_price:.3f}"
-                                f"  btc={btc:.2f}  ptb={ptb:.2f} — waiting",
-                                flush=True,
-                            )
+                        # Fill immediately — we're ahead of the trigger
+                        sim_filled = best_ask
+                        sim_shares = cfg.hedge_bet_usd / sim_filled
+                        fill_elapsed = elapsed_s
+                        fill_source = "anticipatory"
+                        peak_price = best_ask
+                        record.hedge_limit_initial_bid = best_ask
+                        record.hedge_trigger_btc = btc
+                        print(
+                            f"[m5] limit_hedge: anticipatory fill t={elapsed_s:.1f}s"
+                            f"  btc={btc:.2f}  ptb={ptb:.2f}"
+                            f"  ask={best_ask:.3f}"
+                            f"  trig={reason}",
+                            flush=True,
+                        )
 
                 if triggered and sim_filled is None:
-                    # Trigger fired, never managed to fill under max_price → skip
                     fill_source = "skipped"
                     record.hedge_trigger_elapsed_s = elapsed_s
                     print(
-                        f"[m5] limit_hedge: trigger fired, ask always > max_price"
-                        f" ({best_ask:.3f} > {cfg.hedge_limit_max_price:.3f})"
-                        f" — hedge skipped",
+                        f"[m5] limit_hedge: trigger fired, no fill yet — hedge skipped",
                         flush=True,
                     )
                     break
@@ -1200,11 +1187,11 @@ class M5Session:
                         now_ms = int(self._time_fn() * 1000)
                         should_place, reason = _in_anticipation_zone(btc, now_ms)
                         if should_place:
-                            if best_ask is not None and best_ask <= cfg.hedge_limit_max_price:
+                            if best_ask is not None:
                                 print(
                                     f"[m5] limit_hedge_live: placing GTC buy t={elapsed_s:.1f}s"
                                     f"  btc={btc:.2f}  ptb={ptb:.2f}"
-                                    f"  ask={best_ask:.3f}  max={cfg.hedge_limit_max_price:.3f}"
+                                    f"  ask={best_ask:.3f}"
                                     f"  trig={reason}",
                                     flush=True,
                                 )
@@ -1212,7 +1199,7 @@ class M5Session:
                                 record.hedge_trigger_btc = btc
                                 oid, imm_price, imm_shares = await executor.post_limit_buy(
                                     hedge_token_id,
-                                    cfg.hedge_limit_max_price,
+                                    best_ask + 0.02,
                                     cfg.hedge_bet_usd,
                                     best_ask,
                                 )
@@ -1234,20 +1221,13 @@ class M5Session:
                                             f"  fill={fill_price:.4f}  shares={fill_shares:.4f}",
                                             flush=True,
                                         )
-                            else:
-                                print(
-                                    f"[m5] limit_hedge_live: zone but ask > max"
-                                    f"  ask={best_ask:.3f} > max={cfg.hedge_limit_max_price:.3f}"
-                                    f"  btc={btc:.2f}  ptb={ptb:.2f} — waiting",
-                                    flush=True,
-                                )
 
                     # Trigger fired before we placed/filled → skip
                     if triggered and buy_order_id is None:
                         fill_source = "skipped"
                         record.hedge_trigger_elapsed_s = elapsed_s
                         print(
-                            f"[m5] limit_hedge_live: trigger fired, ask > max → skipped",
+                            f"[m5] limit_hedge_live: trigger fired, no fill yet → skipped",
                             flush=True,
                         )
                         break
