@@ -1149,6 +1149,39 @@ class M5Session:
         sl_triggered: bool = False
         peak_price: float = 0.0
 
+        def _in_anticipation_zone(btc: float, now_ms: int) -> "tuple[bool, str]":
+            min_buf = cfg.hedge_anticipation_min_buffer_usd
+            if entry_side == "up" and btc < ptb + min_buf:
+                return True, "safety_floor"
+            if entry_side == "down" and btc > ptb - min_buf:
+                return True, "safety_floor"
+            btc_past = self._btc_history.price_n_secs_ago(
+                cfg.hedge_velocity_window_s, now_ms
+            )
+            if btc_past is not None:
+                velocity = (btc - btc_past) / cfg.hedge_velocity_window_s
+                if entry_side == "up":
+                    trigger_level = ptb - cfg.hedge_threshold
+                    distance = btc - trigger_level
+                    if velocity < 0 and distance > 0:
+                        eta_s = distance / abs(velocity)
+                        if eta_s < cfg.hedge_anticipation_seconds:
+                            return True, f"velocity(eta={eta_s:.1f}s,v={velocity:+.2f})"
+                else:
+                    trigger_level = ptb + cfg.hedge_threshold
+                    distance = trigger_level - btc
+                    if velocity > 0 and distance > 0:
+                        eta_s = distance / velocity
+                        if eta_s < cfg.hedge_anticipation_seconds:
+                            return True, f"velocity(eta={eta_s:.1f}s,v={velocity:+.2f})"
+                return False, ""
+            buf = cfg.hedge_anticipation_buffer_usd
+            if entry_side == "up" and btc < ptb + buf:
+                return True, "static_fallback"
+            if entry_side == "down" and btc > ptb - buf:
+                return True, "static_fallback"
+            return False, ""
+
         while self._time_fn() < window_end_s:
             elapsed_s = self._elapsed(window_ts)
 
@@ -1162,48 +1195,52 @@ class M5Session:
                              and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold))
 
                 if buy_order_id is None:
-                    # Decide whether to place the buy order — same condition as paper.
-                    if btc is not None and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold):
-                        if best_ask is not None and best_ask <= cfg.hedge_limit_max_price:
-                            print(
-                                f"[m5] limit_hedge_live: placing GTC buy t={elapsed_s:.1f}s"
-                                f"  btc={btc:.2f}  ptb={ptb:.2f}"
-                                f"  ask={best_ask:.3f}  max={cfg.hedge_limit_max_price:.3f}",
-                                flush=True,
-                            )
-                            record.hedge_limit_initial_bid = best_ask
-                            record.hedge_trigger_btc = btc
-                            oid, imm_price, imm_shares = await executor.post_limit_buy(
-                                hedge_token_id,
-                                cfg.hedge_limit_max_price,
-                                cfg.hedge_bet_usd,
-                                best_ask,
-                            )
-                            if oid is None:
+                    # Decide whether to place the buy order
+                    if btc is not None:
+                        now_ms = int(self._time_fn() * 1000)
+                        should_place, reason = _in_anticipation_zone(btc, now_ms)
+                        if should_place:
+                            if best_ask is not None and best_ask <= cfg.hedge_limit_max_price:
                                 print(
-                                    f"[m5] limit_hedge_live: buy order rejected — retry next tick",
+                                    f"[m5] limit_hedge_live: placing GTC buy t={elapsed_s:.1f}s"
+                                    f"  btc={btc:.2f}  ptb={ptb:.2f}"
+                                    f"  ask={best_ask:.3f}  max={cfg.hedge_limit_max_price:.3f}"
+                                    f"  trig={reason}",
                                     flush=True,
                                 )
-                            else:
-                                buy_order_id = oid
-                                if imm_price is not None:
-                                    fill_price = imm_price
-                                    fill_shares = imm_shares
-                                    fill_elapsed = elapsed_s
-                                    fill_source = "triggered"
-                                    peak_price = fill_price
+                                record.hedge_limit_initial_bid = best_ask
+                                record.hedge_trigger_btc = btc
+                                oid, imm_price, imm_shares = await executor.post_limit_buy(
+                                    hedge_token_id,
+                                    cfg.hedge_limit_max_price,
+                                    cfg.hedge_bet_usd,
+                                    best_ask,
+                                )
+                                if oid is None:
                                     print(
-                                        f"[m5] limit_hedge_live: immediate fill t={elapsed_s:.1f}s"
-                                        f"  fill={fill_price:.4f}  shares={fill_shares:.4f}",
+                                        f"[m5] limit_hedge_live: buy order rejected — retry next tick",
                                         flush=True,
                                     )
-                        else:
-                            print(
-                                f"[m5] limit_hedge_live: triggered but ask > max"
-                                f"  ask={best_ask:.3f} > max={cfg.hedge_limit_max_price:.3f}"
-                                f"  btc={btc:.2f}  ptb={ptb:.2f} — waiting",
-                                flush=True,
-                            )
+                                else:
+                                    buy_order_id = oid
+                                    if imm_price is not None:
+                                        fill_price = imm_price
+                                        fill_shares = imm_shares
+                                        fill_elapsed = elapsed_s
+                                        fill_source = "anticipatory"
+                                        peak_price = fill_price
+                                        print(
+                                            f"[m5] limit_hedge_live: immediate fill t={elapsed_s:.1f}s"
+                                            f"  fill={fill_price:.4f}  shares={fill_shares:.4f}",
+                                            flush=True,
+                                        )
+                            else:
+                                print(
+                                    f"[m5] limit_hedge_live: zone but ask > max"
+                                    f"  ask={best_ask:.3f} > max={cfg.hedge_limit_max_price:.3f}"
+                                    f"  btc={btc:.2f}  ptb={ptb:.2f} — waiting",
+                                    flush=True,
+                                )
 
                     # Trigger fired before we placed/filled → skip
                     if triggered and buy_order_id is None:
