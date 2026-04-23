@@ -1280,6 +1280,8 @@ class M5Session:
                             f"  → limit sell at {sl_level:.4f}",
                             flush=True,
                         )
+                        # Wait for CLOB to settle hedge fill balance before selling
+                        await asyncio.sleep(3.0)
                         sl_order_id = await executor.post_limit_sell(
                             hedge_token_id, sl_level, fill_shares
                         )

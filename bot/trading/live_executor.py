@@ -245,6 +245,17 @@ class LiveOrderExecutor:
         price = max(price, 0.02)
         size = round(usd_amount / price, 4)
 
+        # Polymarket CLOB requires minimum 5 shares per order for these markets.
+        # If we can't reach 5 shares within budget, skip this tick.
+        _MIN_SHARES = 5.0
+        if size < _MIN_SHARES:
+            print(
+                f"[live] FAK skip: size={size:.2f} < min {_MIN_SHARES}"
+                f"  ask={observed_ask:.3f}  budget={usd_amount:.2f}",
+                flush=True,
+            )
+            return 0.0, None, 0.0
+
         args = OrderArgs(token_id=token_id, price=price, size=size, side="BUY")
         signed = self._client.create_order(args)
         resp = self._client.post_order(signed, OrderType.GTC)
@@ -257,7 +268,7 @@ class LiveOrderExecutor:
         # Cancel any unfilled remainder (makes this FAK)
         if order_id:
             try:
-                self._client.cancel_order(order_id)
+                self._client.cancel(order_id)
             except Exception:
                 pass  # already fully filled — ignore
 
@@ -277,7 +288,7 @@ class LiveOrderExecutor:
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an open order. Returns True on success."""
         try:
-            await asyncio.to_thread(self._client.cancel_order, order_id)
+            await asyncio.to_thread(self._client.cancel, order_id)
             print(f"[live] cancelled order {order_id}", flush=True)
             return True
         except Exception as exc:
