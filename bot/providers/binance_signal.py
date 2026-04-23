@@ -35,6 +35,7 @@ from .normalize_rtds import normalize_binance_aggtrade
 
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+BINANCE_ETH_WS_URL = "wss://stream.binance.com:9443/ws/ethusdt@aggTrade"
 BINANCE_US_WS_URL = "wss://stream.binance.us:9443/ws/btcusdt@aggTrade"
 BINANCE_US_ETH_WS_URL = "wss://stream.binance.us:9443/ws/ethusdt@aggTrade"
 _BACKOFF_DELAYS = (1.0, 2.0, 4.0, 8.0)

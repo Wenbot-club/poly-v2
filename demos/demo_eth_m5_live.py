@@ -36,7 +36,7 @@ sys.stderr.reconfigure(line_buffering=True)
 from bot.latency import LatencyRecord, LatencyTracker
 from bot.m5_session import M5Session, M5SignalState, BtcHistory
 from bot.m5_summary import TradeRecord, aggregate_trades
-from bot.providers.coinbase_signal import CoinbaseSignalProvider
+from bot.providers.binance_signal import BinanceSignalProvider, BINANCE_ETH_WS_URL
 from bot.providers.polymarket_chainlink_signal import PolymarketChainlinkSignalProvider
 from bot.providers.polymarket_market_data import PolymarketMarketDataProvider
 from bot.settings import DEFAULT_ETH_M5_CONFIG, M5Config
@@ -50,9 +50,9 @@ async def _update_price_loop(
     state: M5SignalState,
     price_history: BtcHistory,
 ) -> None:
-    """Stream Coinbase ETH/USD ticker → state + history."""
-    print("[coinbase] connecting to wss://ws-feed.exchange.coinbase.com (ETH-USD)", flush=True)
-    provider = CoinbaseSignalProvider(session=http)
+    """Stream Binance ETH/USDT aggTrade → state + history."""
+    print("[binance] connecting to wss://stream.binance.com:9443/ws/ethusdt@aggTrade", flush=True)
+    provider = BinanceSignalProvider(session=http, ws_url=BINANCE_ETH_WS_URL)
     await provider.connect("eth/usd")
     try:
         async for tick in provider.iter_signals():
