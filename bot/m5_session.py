@@ -1185,7 +1185,7 @@ class M5Session:
                 triggered = (btc is not None
                              and should_hedge(entry_side, btc, ptb, cfg.hedge_threshold))
 
-                if buy_order_id is None:
+                if True:
                     # Start accumulation when in anticipation zone
                     if not accumulating and btc is not None:
                         now_ms = int(self._time_fn() * 1000)
