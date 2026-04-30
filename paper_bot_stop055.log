@@ -1,0 +1,9 @@
+
+=== Paper Bot leg1_stop_0.55_C ===
+Strategy: leg1 + stop-buy hedge a 0.55, delai 11s
+Stakes: leg1=$1.0, hedge=$2.0
+Log file: /home/user/poly-v2/paper_log.jsonl
+Stoppe avec Ctrl+C
+
+
+[18:29:20] Next window: 18:30:00 UTC (in 39s)
