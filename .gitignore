@@ -9,4 +9,5 @@ build/
 .venv/
 venv/
 *.jsonl
+*.log
 m5_out/
